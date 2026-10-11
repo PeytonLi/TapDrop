@@ -32,7 +32,10 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Slider
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
@@ -48,12 +51,17 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.lifecycleScope
 import dev.peytonli.tapdrop.core.RelayClient
+import dev.peytonli.tapdrop.core.TapConfig
 import dev.peytonli.tapdrop.pairing.PairingRecord
 import dev.peytonli.tapdrop.pairing.PairingStorage
 import dev.peytonli.tapdrop.pairing.RecentEntry
 import dev.peytonli.tapdrop.pairing.RecentStore
 import dev.peytonli.tapdrop.pairing.PairScannerActivity
 import dev.peytonli.tapdrop.service.RelayService
+import dev.peytonli.tapdrop.service.TapDropAccessibilityService
+import dev.peytonli.tapdrop.service.TapSensorSnapshot
+import dev.peytonli.tapdrop.service.TapSensorStatus
+import dev.peytonli.tapdrop.service.TapSettings
 import dev.peytonli.tapdrop.share.SendClipboardTileService
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -67,6 +75,7 @@ class MainActivity : ComponentActivity() {
         refreshScreen?.invoke()
     }
     private val notificationPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
+    private val photoPermission = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -74,6 +83,12 @@ class MainActivity : ComponentActivity() {
         setContent {
             var paired by remember { mutableStateOf(pairingStorage.load()) }
             var recent by remember { mutableStateOf(recentStore.load()) }
+            val tapSettings = remember { TapSettings(this@MainActivity) }
+            var magnetEnabled by remember { mutableStateOf(tapSettings.enabled()) }
+            var tapConfig by remember { mutableStateOf(tapSettings.config()) }
+            var dryRun by remember { mutableStateOf(tapSettings.dryRun()) }
+            var calibration by remember { mutableStateOf(false) }
+            val sensorSnapshot by TapSensorStatus.state.collectAsState()
             val connection by RelayService.status.collectAsState()
             refreshScreen = {
                 paired = pairingStorage.load()
@@ -81,18 +96,44 @@ class MainActivity : ComponentActivity() {
                 if (paired != null) RelayService.start(this)
             }
             TapDropTheme {
-                MainScreen(
-                    paired = paired,
-                    recent = recent,
-                    connected = connection.connected,
-                    peerOnline = connection.peerOnline,
-                    onPair = { pairLauncher.launch(Intent(this, PairScannerActivity::class.java)) },
-                    onUnpair = { unpair() },
-                    onNotifications = { requestNotifications() },
-                    onBattery = { requestBatteryExemption() },
-                    onAddTile = { requestTile() },
-                    onRecent = ::openRecent,
-                )
+                if (calibration) {
+                    CalibrationScreen(
+                        snapshot = sensorSnapshot,
+                        config = tapConfig,
+                        dryRun = dryRun,
+                        onBack = { calibration = false },
+                        onConfigChange = {
+                            tapConfig = it
+                            tapSettings.setConfig(it)
+                        },
+                        onDryRunChange = {
+                            dryRun = it
+                            tapSettings.setDryRun(it)
+                        },
+                    )
+                } else {
+                    MainScreen(
+                        paired = paired,
+                        recent = recent,
+                        connected = connection.connected,
+                        peerOnline = connection.peerOnline,
+                        magnetEnabled = magnetEnabled,
+                        onMagnetEnabled = {
+                            magnetEnabled = it
+                            tapSettings.setEnabled(it)
+                            if (it && paired != null) RelayService.start(this)
+                        },
+                        onCalibration = { calibration = true },
+                        onAccessibility = { openAccessibilitySettings() },
+                        onPhotos = { requestPhotos() },
+                        onPair = { pairLauncher.launch(Intent(this, PairScannerActivity::class.java)) },
+                        onUnpair = { unpair() },
+                        onNotifications = { requestNotifications() },
+                        onBattery = { requestBatteryExemption() },
+                        onAddTile = { requestTile() },
+                        onRecent = ::openRecent,
+                    )
+                }
             }
         }
     }
@@ -124,6 +165,27 @@ class MainActivity : ComponentActivity() {
         if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED)
             notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
         else Toast.makeText(this, "Notifications are enabled", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun requestPhotos() {
+        val permissions = when {
+            Build.VERSION.SDK_INT >= 34 -> arrayOf(
+                Manifest.permission.READ_MEDIA_IMAGES,
+                Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED,
+            )
+            Build.VERSION.SDK_INT >= 33 -> arrayOf(Manifest.permission.READ_MEDIA_IMAGES)
+            else -> arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE)
+        }
+        photoPermission.launch(permissions)
+    }
+
+    private fun openAccessibilitySettings() {
+        Toast.makeText(
+            this,
+            "On Android 13+, open TapDrop App info → ⋮ → Allow restricted settings, then enable TapDrop accessibility.",
+            Toast.LENGTH_LONG,
+        ).show()
+        startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
     }
 
     private fun requestBatteryExemption() {
@@ -188,6 +250,11 @@ private fun MainScreen(
     recent: List<RecentEntry>,
     connected: Boolean,
     peerOnline: Boolean,
+    magnetEnabled: Boolean,
+    onMagnetEnabled: (Boolean) -> Unit,
+    onCalibration: () -> Unit,
+    onAccessibility: () -> Unit,
+    onPhotos: () -> Unit,
     onPair: () -> Unit,
     onUnpair: () -> Unit,
     onNotifications: () -> Unit,
@@ -200,6 +267,12 @@ private fun MainScreen(
     val notificationsGranted = Build.VERSION.SDK_INT < 33 ||
         context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == android.content.pm.PackageManager.PERMISSION_GRANTED
     val batteryUnrestricted = manager.isIgnoringBatteryOptimizations(context.packageName)
+    val accessibilityEnabled = TapDropAccessibilityService.isEnabled(context)
+    val photosGranted = if (Build.VERSION.SDK_INT >= 33) {
+        context.checkSelfPermission(Manifest.permission.READ_MEDIA_IMAGES) == android.content.pm.PackageManager.PERMISSION_GRANTED
+    } else {
+        context.checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE) == android.content.pm.PackageManager.PERMISSION_GRANTED
+    }
 
     Surface(color = MaterialTheme.colorScheme.background, modifier = Modifier.fillMaxSize()) {
         LazyColumn(
@@ -240,6 +313,22 @@ private fun MainScreen(
             }
             item {
                 Card(colors = CardDefaults.cardColors(containerColor = Color.White), shape = RoundedCornerShape(20.dp)) {
+                    Column(Modifier.fillMaxWidth().padding(18.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                            Column(Modifier.weight(1f)) {
+                                Text("Magnet tap", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                                Text("Tap your phone to the laptop edge to send", color = Color(0xFF596174))
+                            }
+                            Switch(checked = magnetEnabled, onCheckedChange = onMagnetEnabled)
+                        }
+                        OutlinedButton(onClick = onCalibration, modifier = Modifier.fillMaxWidth()) {
+                            Text("Calibrate magnet tap")
+                        }
+                    }
+                }
+            }
+            item {
+                Card(colors = CardDefaults.cardColors(containerColor = Color.White), shape = RoundedCornerShape(20.dp)) {
                     Column(Modifier.fillMaxWidth().padding(18.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                         Text("Finish setup", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
                         SetupRow("Notifications", if (notificationsGranted) "Enabled" else "Allow received-item alerts", onNotifications)
@@ -249,6 +338,16 @@ private fun MainScreen(
                             onBattery,
                         )
                         SetupRow("Quick Settings tile", "Add Send to laptop for one-tap clipboard sharing", onAddTile)
+                        SetupRow(
+                            "Accessibility: ${if (accessibilityEnabled) "Enabled" else "Enable tap-to-send"}",
+                            "Reads a supported browser URL or captures the screen only after a tap. Android 13+: App info → ⋮ → Allow restricted settings.",
+                            onAccessibility,
+                        )
+                        SetupRow(
+                            "Photos: ${if (photosGranted) "Full access enabled" else "Allow full photo access"}",
+                            "TapDrop skips selected-only photo access and sends a recent image only.",
+                            onPhotos,
+                        )
                     }
                 }
             }
@@ -292,5 +391,98 @@ private fun SetupRow(title: String, detail: String, onClick: () -> Unit) {
             Text(detail, style = MaterialTheme.typography.bodySmall, color = Color(0xFF596174))
         }
         Text("Set up", color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.labelLarge)
+    }
+}
+
+@Composable
+private fun CalibrationScreen(
+    snapshot: TapSensorSnapshot,
+    config: TapConfig,
+    dryRun: Boolean,
+    onBack: () -> Unit,
+    onConfigChange: (TapConfig) -> Unit,
+    onDryRunChange: (Boolean) -> Unit,
+) {
+    val detector = snapshot.detector
+    Surface(color = MaterialTheme.colorScheme.background, modifier = Modifier.fillMaxSize()) {
+        LazyColumn(
+            modifier = Modifier.fillMaxSize().padding(horizontal = 20.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            item {
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    TextButton(onClick = onBack) { Text("Back") }
+                    Text("Magnet calibration", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                }
+            }
+            item {
+                Card(colors = CardDefaults.cardColors(containerColor = Color.White)) {
+                    Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text("Live sensors", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                        Text("|B| ${"%.1f".format(detector.magnitudeUt)} µT · baseline ${"%.1f".format(detector.baselineUt)} µT")
+                        Text("Near: ${if (detector.near) "yes" else "no"} · acceleration ${"%.2f".format(detector.linearMagnitudeMs2)} m/s²")
+                        Text(
+                            when {
+                                !snapshot.sensorAvailable -> "Required sensors unavailable"
+                                snapshot.listening -> "Listening while laptop is online and screen is unlocked"
+                                else -> "Waiting for laptop online, screen unlocked, or Magnet tap enabled"
+                            },
+                            color = Color(0xFF596174),
+                        )
+                    }
+                }
+            }
+            item { CalibrationSlider("Magnet delta", config.deltaUt, "µT", 25f..500f) { onConfigChange(config.copy(deltaUt = it)) } }
+            item { CalibrationSlider("Absolute field", config.absoluteUt, "µT", 100f..700f) { onConfigChange(config.copy(absoluteUt = it)) } }
+            item { CalibrationSlider("Bump threshold", config.bumpMs2, "m/s²", 0.5f..10f) { onConfigChange(config.copy(bumpMs2 = it)) } }
+            item {
+                val value = config.windowMs.toFloat()
+                CalibrationSlider("Bump window", value, "ms", 50f..1000f) {
+                    onConfigChange(config.copy(windowMs = it.toLong()))
+                }
+            }
+            item {
+                Card(colors = CardDefaults.cardColors(containerColor = Color.White)) {
+                    Row(
+                        Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text("Dry run", fontWeight = FontWeight.SemiBold)
+                            Text("Show the URL or image filename without sending", color = Color(0xFF596174))
+                        }
+                        Switch(checked = dryRun, onCheckedChange = onDryRunChange)
+                    }
+                }
+            }
+            item { Text("Last 10 triggers", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold) }
+            if (snapshot.triggers.isEmpty()) {
+                item { Text("No triggers yet. Keep the screen unlocked with the laptop online.", color = Color(0xFF596174)) }
+            } else {
+                items(snapshot.triggers) { trigger ->
+                    Text(
+                        "|B| ${"%.1f".format(trigger.magnitudeUt)} µT · bump ${"%.2f".format(trigger.linearMagnitudeMs2)} m/s²",
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp),
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun CalibrationSlider(
+    title: String,
+    value: Float,
+    unit: String,
+    range: ClosedFloatingPointRange<Float>,
+    onChange: (Float) -> Unit,
+) {
+    Card(colors = CardDefaults.cardColors(containerColor = Color.White)) {
+        Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)) {
+            Text("$title: ${"%.1f".format(value)} $unit", fontWeight = FontWeight.Medium)
+            Slider(value = value.coerceIn(range), onValueChange = onChange, valueRange = range)
+        }
     }
 }

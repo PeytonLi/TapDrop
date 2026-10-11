@@ -10,7 +10,9 @@ import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.content.ContentUris
 import android.graphics.BitmapFactory
+import android.graphics.Bitmap
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.Uri
@@ -18,6 +20,9 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.os.VibratorManager
 import android.provider.MediaStore
 import android.provider.OpenableColumns
 import android.widget.Toast
@@ -31,12 +36,14 @@ import dev.peytonli.tapdrop.core.RelayClient
 import dev.peytonli.tapdrop.core.RelayConnectionState
 import dev.peytonli.tapdrop.core.ReceivedItem
 import dev.peytonli.tapdrop.core.ShareText
+import dev.peytonli.tapdrop.core.TapTrigger
 import dev.peytonli.tapdrop.pairing.PairingRecord
 import dev.peytonli.tapdrop.pairing.PairingStorage
 import dev.peytonli.tapdrop.pairing.RecentEntry
 import dev.peytonli.tapdrop.pairing.RecentStore
 import java.io.File
 import java.io.IOException
+import java.io.ByteArrayOutputStream
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -51,6 +58,7 @@ class RelayService : Service() {
     private lateinit var pairingStorage: PairingStorage
     private var pairing: PairingRecord? = null
     private var client: RelayClient? = null
+    private var tapSensors: TapSensorController? = null
     private var networkManager: ConnectivityManager? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
 
@@ -59,6 +67,9 @@ class RelayService : Service() {
         pairingStorage = PairingStorage(this)
         createChannels()
         startForegroundStatus()
+        tapSensors = TapSensorController(this) { trigger ->
+            serviceScope.launch { handleTapTrigger(trigger) }
+        }
         connect()
         observeNetworkChanges()
     }
@@ -78,6 +89,8 @@ class RelayService : Service() {
         networkCallback?.let { callback -> networkManager?.unregisterNetworkCallback(callback) }
         client?.close()
         client = null
+        tapSensors?.close()
+        tapSensors = null
         serviceScope.cancel()
         _status.value = RelayConnectionState()
         super.onDestroy()
@@ -93,6 +106,7 @@ class RelayService : Service() {
         serviceScope.launch {
             relayClient.connectionState.collect { state ->
                 _status.value = state
+                tapSensors?.setPeerOnline(state.peerOnline)
                 val description = when {
                     state.peerOnline -> "Connected — laptop online"
                     state.connected -> "Connected — laptop offline"
@@ -180,6 +194,115 @@ class RelayService : Service() {
             file.delete()
             throw error
         }
+    }
+
+    private suspend fun handleTapTrigger(trigger: TapTrigger) {
+        val saved = pairing ?: pairingStorage.load() ?: return
+        withContext(Dispatchers.Main) {
+            vibrateForTap()
+            showToast("Sending to ${saved.laptopName}…")
+        }
+        val photo = findRecentImage()
+        val payload: TapPayload = if (photo != null) {
+            TapPayload.Photo(photo.first, photo.second)
+        } else {
+            if (!TapDropAccessibilityService.isEnabled(this)) {
+                showToast("Enable TapDrop accessibility for tap-to-send")
+                return
+            }
+            val accessibility = TapDropAccessibilityService.current()
+            if (accessibility == null) {
+                showToast("Enable TapDrop accessibility for tap-to-send")
+                return
+            }
+            val (rawUrl, screenBitmap) = withContext(Dispatchers.Main) {
+                val url = accessibility.currentBrowserUrl()
+                url to if (url.isNullOrBlank()) accessibility.screenshot() else null
+            }
+            if (!rawUrl.isNullOrBlank()) {
+                android.util.Log.i("TapDrop", "Magnet tap browser URL: $rawUrl")
+                val normalized = if (URL_SCHEME.containsMatchIn(rawUrl)) rawUrl else "https://$rawUrl"
+                TapPayload.Url(normalized)
+            } else {
+                val bitmap = screenBitmap
+                if (bitmap == null) {
+                    showToast("Couldn't capture this screen")
+                    return
+                }
+                val output = ByteArrayOutputStream()
+                bitmap.compress(Bitmap.CompressFormat.PNG, 100, output)
+                bitmap.recycle()
+                TapPayload.Screen(output.toByteArray(), "screen-${System.currentTimeMillis()}.png")
+            }
+        }
+        if (TapSettings(this).dryRun()) {
+            val description = when (payload) {
+                is TapPayload.Url -> "URL · ${payload.url}"
+                is TapPayload.Photo -> "image · ${payload.name}"
+                is TapPayload.Screen -> "image · ${payload.name}"
+            }
+            showToast("Dry run: $description")
+            return
+        }
+        val relayClient = client ?: return
+        val disconnected = !relayClient.connectionState.value.connected
+        if (disconnected) showToast("Queued — will send when online")
+        try {
+            when (payload) {
+                is TapPayload.Url -> relayClient.sendUrl(payload.url, "tap")
+                is TapPayload.Photo -> {
+                    val cached = copySharedUri(payload.uri)
+                    try { relayClient.sendFile(cached.file, cached.mime, source = "tap") }
+                    finally { cached.file.delete() }
+                }
+                is TapPayload.Screen -> {
+                    val cached = File(cacheDir, payload.name)
+                    try {
+                        cached.writeBytes(payload.bytes)
+                        relayClient.sendFile(cached, "image/png", kind = "image", source = "tap")
+                    } finally {
+                        cached.delete()
+                    }
+                }
+            }
+            if (!disconnected) showToast("Sent to ${saved.laptopName}")
+        } catch (error: Exception) {
+            android.util.Log.e("TapDrop", "Magnet tap send failed", error)
+            showToast(error.message ?: "TapDrop could not send the item")
+        }
+    }
+
+    private fun findRecentImage(): Pair<Uri, String>? {
+        val hasFullImageAccess = if (Build.VERSION.SDK_INT >= 33) {
+            checkSelfPermission(Manifest.permission.READ_MEDIA_IMAGES) == android.content.pm.PackageManager.PERMISSION_GRANTED
+        } else {
+            checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE) == android.content.pm.PackageManager.PERMISSION_GRANTED
+        }
+        if (!hasFullImageAccess) return null
+        val cutoffSeconds = System.currentTimeMillis() / 1000 - 60
+        val columns = arrayOf(MediaStore.Images.Media._ID, MediaStore.Images.Media.DISPLAY_NAME)
+        val selection = "${MediaStore.Images.Media.DATE_ADDED} >= ? AND ${MediaStore.Images.Media.IS_PENDING}=0"
+        return contentResolver.query(
+            MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+            columns,
+            selection,
+            arrayOf(cutoffSeconds.toString()),
+            "${MediaStore.Images.Media.DATE_ADDED} DESC",
+        )?.use { cursor ->
+            if (!cursor.moveToFirst()) return@use null
+            val id = cursor.getLong(cursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID))
+            val name = cursor.getString(cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DISPLAY_NAME)) ?: "recent-photo"
+            ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id) to name
+        }
+    }
+
+    private fun vibrateForTap() {
+        val vibrator = if (Build.VERSION.SDK_INT >= 31) {
+            getSystemService(VibratorManager::class.java).defaultVibrator
+        } else {
+            getSystemService(VIBRATOR_SERVICE) as Vibrator
+        }
+        if (vibrator.hasVibrator()) vibrator.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_CLICK))
     }
 
     private suspend fun receive(saved: PairingRecord, received: ReceivedItem) {
@@ -335,6 +458,12 @@ class RelayService : Service() {
 
     private data class CachedShare(val file: File, val mime: String)
 
+    private sealed interface TapPayload {
+        data class Url(val url: String) : TapPayload
+        data class Photo(val uri: Uri, val name: String) : TapPayload
+        data class Screen(val bytes: ByteArray, val name: String) : TapPayload
+    }
+
     companion object {
         const val ACTION_START = "dev.peytonli.tapdrop.START"
         const val ACTION_SEND = "dev.peytonli.tapdrop.SEND"
@@ -346,6 +475,7 @@ class RelayService : Service() {
         private const val RECEIVED_CHANNEL = "tapdrop-received"
         private const val STATUS_ID = 1201
         private const val MAX_BLOB_BYTES = 95L * 1024 * 1024
+        private val URL_SCHEME = Regex("^[A-Za-z][A-Za-z0-9+.-]*:")
         private val _status = MutableStateFlow(RelayConnectionState())
         val status = _status.asStateFlow()
 
