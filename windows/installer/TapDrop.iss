@@ -47,6 +47,8 @@ Type: files; Name: "{usersendto}\TapDrop (phone).lnk"
 [Code]
 var
   WasRunning: Boolean;
+  InstallCompleted: Boolean;
+  ClosedExePath: String;
 
 function WaitForTapDropExit(TimeoutMs: Integer): Boolean;
 var
@@ -66,17 +68,35 @@ var
   ResultCode: Integer;
 begin
   Result := CheckForMutexes('Local\TapDrop.Tray');
-  if not Result then
+  if not Result then begin
+    Log('TapDrop tray was not running.');
     Exit;
+  end;
 
-  if FileExists(ExePath) then
-    Exec(ExePath, '--quit', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Log('TapDrop tray was running.');
+  if FileExists(ExePath) then begin
+    Log('Sending --quit to TapDrop tray.');
+    if Exec(ExePath, '--quit', '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+      Log('Sent --quit to TapDrop tray.')
+    else
+      Log('Could not send --quit to TapDrop tray.');
+  end else
+    Log('TapDrop executable was not found; skipping --quit.');
 
-  if WaitForTapDropExit(5000) then
+  if WaitForTapDropExit(5000) then begin
+    Log('TapDrop tray exited after --quit.');
     Exit;
+  end;
 
-  Exec('taskkill.exe', '/F /IM TapDrop.Tray.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-  WaitForTapDropExit(3000);
+  Log('TapDrop tray did not exit after --quit; using taskkill fallback.');
+  if Exec('taskkill.exe', '/F /IM TapDrop.Tray.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+    Log('Started taskkill fallback for TapDrop tray.')
+  else
+    Log('Could not start taskkill fallback for TapDrop tray.');
+  if WaitForTapDropExit(3000) then
+    Log('TapDrop tray exited after taskkill fallback.')
+  else
+    Log('TapDrop tray was still running after taskkill fallback.');
 end;
 
 function InitializeSetup(): Boolean;
@@ -90,7 +110,8 @@ begin
     'InstallLocation',
     ExistingInstallDir) then
     ExistingInstallDir := ExpandConstant('{localappdata}\Programs\TapDrop\');
-  WasRunning := CloseRunningTapDrop(AddBackslash(ExistingInstallDir) + 'TapDrop.Tray.exe');
+  ClosedExePath := AddBackslash(ExistingInstallDir) + 'TapDrop.Tray.exe';
+  WasRunning := CloseRunningTapDrop(ClosedExePath);
   Result := True;
 end;
 
@@ -98,14 +119,30 @@ procedure CurStepChanged(CurStep: TSetupStep);
 var
   ResultCode: Integer;
 begin
-  if (CurStep = ssPostInstall) and WizardSilent and WasRunning then
-    ExecAsOriginalUser(
-      ExpandConstant('{app}\TapDrop.Tray.exe'),
-      '',
-      '',
-      SW_SHOWNORMAL,
-      ewNoWait,
-      ResultCode);
+  if CurStep = ssPostInstall then begin
+    InstallCompleted := True;
+    if WizardSilent and WasRunning then
+      ExecAsOriginalUser(
+        ExpandConstant('{app}\TapDrop.Tray.exe'),
+        '',
+        '',
+        SW_SHOWNORMAL,
+        ewNoWait,
+        ResultCode);
+  end;
+end;
+
+procedure DeinitializeSetup();
+var
+  ResultCode: Integer;
+begin
+  if WasRunning and not InstallCompleted and FileExists(ClosedExePath) then begin
+    Log('Setup did not complete; relaunching the previous TapDrop tray.');
+    if ExecAsOriginalUser(ClosedExePath, '', '', SW_SHOWNORMAL, ewNoWait, ResultCode) then
+      Log('Relaunched the previous TapDrop tray.')
+    else
+      Log('Could not relaunch the previous TapDrop tray.');
+  end;
 end;
 
 function InitializeUninstall(): Boolean;

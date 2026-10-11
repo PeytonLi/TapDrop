@@ -8,7 +8,7 @@ $ErrorActionPreference = 'Stop'
 
 $installerPath = (Resolve-Path $Installer).Path
 $upgradeInstallerPath = if ($UpgradeInstaller) { (Resolve-Path $UpgradeInstaller).Path } else { $null }
-$verificationRoot = Join-Path $env:USERPROFILE 'tapdrop-verify'
+$verificationRoot = Join-Path ([IO.Path]::GetTempPath()) 'tapdrop-smoke'
 New-Item -ItemType Directory -Path $verificationRoot -Force | Out-Null
 
 $appDir = Join-Path $env:LOCALAPPDATA 'Programs\TapDrop'
