@@ -13,6 +13,12 @@ network (including campus Wi-Fi with client isolation), via an end-to-end encryp
 Phase 1: share sheet / Quick Settings tile / hotkey / Send-to sharing. Phase 2: magnet-tap gesture (phone
 magnetometer + accelerometer at the laptop's right edge). Phase 3: laptop → phone gestures, LAN fast path.
 
+## Install on Windows
+
+Download `TapDrop-Setup-<version>.exe` from [GitHub Releases](https://github.com/PeytonLi/TapDrop/releases). The installer is per-user and does not require admin rights. Windows SmartScreen may show a warning because the installer is unsigned; choose **More info → Run anyway**. To update, run the newer installer; it closes TapDrop and upgrades in place. Uninstall from **Settings → Apps**; your settings and pairing data are kept unless you choose to delete them.
+
+For a silent install, use `/VERYSILENT /CURRENTUSER`. To also delete user data during silent uninstall, pass `/DELETEUSERDATA` to `unins000.exe`.
+
 ## Development
 
 Run the local relay or deploy it with Wrangler:
@@ -32,6 +38,10 @@ dotnet run --project windows/TapDrop.Cli -- pair-new --relay http://127.0.0.1:87
 dotnet run --project windows/TapDrop.Cli -- listen --config laptop.json --role laptop --save-dir received
 dotnet run --project windows/TapDrop.Cli -- send-text --config laptop.json --role laptop --text "Hello"
 ```
+
+### Cutting a release
+
+Bump `<Version>` in `windows/Directory.Build.props`, create a `vX.Y.Z` tag, and push it. To build the Windows installer locally, run `pwsh windows/installer/build.ps1`.
 
 ### Android
 
