@@ -23,6 +23,10 @@ internal static class Program
         }
 
         ApplicationConfiguration.Initialize();
+        Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+        Application.ThreadException += (_, eventArgs) => TrayLog.Write(eventArgs.Exception.ToString());
+        AppDomain.CurrentDomain.UnhandledException += (_, eventArgs) =>
+            TrayLog.Write($"Unhandled CLR exception (terminating: {eventArgs.IsTerminating}): {eventArgs.ExceptionObject}");
         Application.Run(new TrayApplicationContext(args));
     }
 }

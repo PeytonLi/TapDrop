@@ -48,8 +48,14 @@ dotnet "$CLI" join --qr "$QR" --name "TapDrop Phone" --out "$TMP/phone.json"
 
 start_listener() {
   local role="$1" config="$2" save_dir="$3" out="$4" err="$5"
+  local ping_interval="${6:-}" pong_timeout="${7:-}"
   mkdir -p "$save_dir"
-  dotnet "$CLI" listen --config "$config" --role "$role" --save-dir "$save_dir" >"$out" 2>"$err" &
+  if [[ -n "$ping_interval" && -n "$pong_timeout" ]]; then
+    TAPDROP_PING_INTERVAL_SECONDS="$ping_interval" TAPDROP_PONG_TIMEOUT_SECONDS="$pong_timeout" \
+      dotnet "$CLI" listen --config "$config" --role "$role" --save-dir "$save_dir" >"$out" 2>"$err" &
+  else
+    dotnet "$CLI" listen --config "$config" --role "$role" --save-dir "$save_dir" >"$out" 2>"$err" &
+  fi
   LISTENER_PID=$!
   python3 - "$err" <<'PY'
 import sys, time
@@ -117,8 +123,13 @@ wait_received "$TMP/laptop.out" text "offline-queue-item"
 kill -TERM "$LISTENER_PID"
 wait "$LISTENER_PID" || true
 LISTENER_PID=""
-start_listener phone "$TMP/phone.json" "$TMP/phone-files" "$TMP/phone.out" "$TMP/phone.err"
+start_listener phone "$TMP/phone.json" "$TMP/phone-files" "$TMP/phone.out" "$TMP/phone.err" 1 1
 dotnet "$CLI" send-text --config "$TMP/laptop.json" --role laptop --text "laptop-to-phone"
 wait_received "$TMP/phone.out" text "laptop-to-phone"
 
-echo "E2E PASS: text, URL, 10 MiB byte-exact file, offline queue, laptop-to-phone"
+dd if=/dev/urandom of="$TMP/ping-regression.bin" bs=1M count=40 status=none
+dotnet "$CLI" send-file --config "$TMP/laptop.json" --role laptop --path "$TMP/ping-regression.bin" --mime application/octet-stream
+wait_received "$TMP/phone.out" file "ping-regression.bin"
+cmp "$TMP/ping-regression.bin" "$TMP/phone-files/ping-regression.bin"
+
+echo "E2E PASS: text, URL, 10 MiB byte-exact file, offline queue, laptop-to-phone, 40 MiB receive with 1s ping timeout"

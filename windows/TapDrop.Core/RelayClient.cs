@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Net;
 using System.Net.Http.Headers;
 using System.Net.WebSockets;
 using System.Security.Cryptography;
@@ -12,6 +13,8 @@ public sealed class RelayClient : IAsyncDisposable
 {
     private const int MaxPlaintextBlobBytes = 95 * 1024 * 1024;
     private const int InlineTextBytes = 32 * 1024;
+    private static readonly TimeSpan StandardRequestTimeout = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan BlobRequestTimeout = TimeSpan.FromMinutes(10);
     private readonly PairInfo _pair;
     private readonly HttpClient _httpClient;
     private readonly Channel<PendingSend> _outgoing = Channel.CreateUnbounded<PendingSend>();
@@ -27,9 +30,10 @@ public sealed class RelayClient : IAsyncDisposable
     public RelayClient(PairInfo pair, HttpClient? httpClient = null)
     {
         _pair = pair;
-        _httpClient = httpClient ?? new HttpClient();
+        _httpClient = httpClient ?? new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
     }
 
+    public Action<string>? Log { get; set; }
     public event Action<bool, bool>? ConnectionChanged;
     public event Action<string>? Delivered;
     public Task Completion => _runTask ?? Task.CompletedTask;
@@ -38,7 +42,8 @@ public sealed class RelayClient : IAsyncDisposable
     {
         using var request = new HttpRequestMessage(HttpMethod.Post, PairUri("/register"));
         request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _pair.AuthToken);
-        using var response = await _httpClient.SendAsync(request, cancellationToken);
+        using var timeout = CreateRequestTimeout(cancellationToken, StandardRequestTimeout);
+        using var response = await _httpClient.SendAsync(request, timeout.Token);
         if (!response.IsSuccessStatusCode)
         {
             throw new HttpRequestException(
@@ -170,7 +175,8 @@ public sealed class RelayClient : IAsyncDisposable
         };
         request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _pair.AuthToken);
         request.Content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
-        using var response = await _httpClient.SendAsync(request, cancellationToken);
+        using var timeout = CreateRequestTimeout(cancellationToken, BlobRequestTimeout);
+        using var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token);
         if (response.StatusCode != System.Net.HttpStatusCode.Created)
         {
             throw new HttpRequestException($"Blob upload failed with {(int)response.StatusCode} {response.ReasonPhrase}.");
@@ -199,15 +205,23 @@ public sealed class RelayClient : IAsyncDisposable
                 connectedAt = DateTime.UtcNow;
                 SetConnection(true, false);
                 using var connection = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-                var receive = ReceiveLoopAsync(socket, connection.Token);
+                var incoming = Channel.CreateUnbounded<JsonElement>(new UnboundedChannelOptions
+                {
+                    SingleReader = true,
+                    SingleWriter = true,
+                });
+                var receive = ReceiveLoopAsync(socket, incoming.Writer, connection.Token);
+                var worker = ProcessMessagesAsync(socket, incoming.Reader, connection.Token);
                 var send = SendLoopAsync(socket, connection.Token);
                 var ping = PingLoopAsync(socket, connection.Token);
-                await Task.WhenAny(receive, send, ping);
+                await Task.WhenAny(receive, send, ping, worker);
                 await connection.CancelAsync();
+                incoming.Writer.TryComplete();
                 socket.Abort();
                 await IgnoreCancellation(receive);
                 await IgnoreCancellation(send);
                 await IgnoreCancellation(ping);
+                await IgnoreCancellation(worker);
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
@@ -215,7 +229,7 @@ public sealed class RelayClient : IAsyncDisposable
             }
             catch (Exception error)
             {
-                Console.Error.WriteLine($"TapDrop relay connection: {error.Message}");
+                WriteLog($"TapDrop relay connection: {error.Message}");
             }
             finally
             {
@@ -235,7 +249,10 @@ public sealed class RelayClient : IAsyncDisposable
         }
     }
 
-    private async Task ReceiveLoopAsync(ClientWebSocket socket, CancellationToken cancellationToken)
+    private async Task ReceiveLoopAsync(
+        ClientWebSocket socket,
+        ChannelWriter<JsonElement> incoming,
+        CancellationToken cancellationToken)
     {
         var buffer = new byte[8192];
         while (socket.State == WebSocketState.Open && !cancellationToken.IsCancellationRequested)
@@ -250,11 +267,14 @@ public sealed class RelayClient : IAsyncDisposable
                 if (message.Length > 1024 * 1024) throw new InvalidDataException("Relay frame exceeded 1 MiB.");
             } while (!result.EndOfMessage);
             using var frame = JsonDocument.Parse(message.ToArray());
-            await HandleFrameAsync(socket, frame.RootElement, cancellationToken);
+            if (GetString(frame.RootElement, "t") == "msg")
+                await incoming.WriteAsync(frame.RootElement.Clone(), cancellationToken);
+            else
+                HandleControlFrame(frame.RootElement);
         }
     }
 
-    private async Task HandleFrameAsync(ClientWebSocket socket, JsonElement frame, CancellationToken cancellationToken)
+    private void HandleControlFrame(JsonElement frame)
     {
         var type = GetString(frame, "t");
         switch (type)
@@ -289,10 +309,16 @@ public sealed class RelayClient : IAsyncDisposable
                 }
                 break;
             }
-            case "msg":
-                await ProcessMessageAsync(socket, frame, cancellationToken);
-                break;
         }
+    }
+
+    private async Task ProcessMessagesAsync(
+        ClientWebSocket socket,
+        ChannelReader<JsonElement> incoming,
+        CancellationToken cancellationToken)
+    {
+        await foreach (var frame in incoming.ReadAllAsync(cancellationToken))
+            await ProcessMessageAsync(socket, frame, cancellationToken);
     }
 
     private async Task ProcessMessageAsync(ClientWebSocket socket, JsonElement frame, CancellationToken cancellationToken)
@@ -311,7 +337,7 @@ public sealed class RelayClient : IAsyncDisposable
         }
 
         string? blobPath = null;
-        var shouldDeleteBlob = false;
+        string? blobIdToDelete = null;
         try
         {
             if (!frame.TryGetProperty("env", out var envelopeElement)) throw new JsonException("Message has no envelope.");
@@ -322,12 +348,18 @@ public sealed class RelayClient : IAsyncDisposable
                 throw new InvalidDataException($"Unknown item kind: {item.Kind}.");
             if (item.Blob is not null)
             {
-                shouldDeleteBlob = true;
+                blobIdToDelete = item.Blob.Id;
                 using var request = new HttpRequestMessage(HttpMethod.Get, PairUri($"/blobs/{item.Blob.Id}"));
                 request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _pair.AuthToken);
-                using var response = await _httpClient.SendAsync(request, cancellationToken);
+                using var timeout = CreateRequestTimeout(cancellationToken, BlobRequestTimeout);
+                using var response = await _httpClient.SendAsync(
+                    request,
+                    HttpCompletionOption.ResponseHeadersRead,
+                    timeout.Token);
+                if (response.StatusCode == HttpStatusCode.NotFound)
+                    throw new PermanentMessageException($"Referenced blob {item.Blob.Id} was not found.");
                 response.EnsureSuccessStatusCode();
-                var encrypted = await response.Content.ReadAsByteArrayAsync(cancellationToken);
+                var encrypted = await response.Content.ReadAsByteArrayAsync(timeout.Token);
                 var plaintext = TapDropCrypto.DecryptBlob(_pair, item.Blob.Id, encrypted);
                 var digest = Convert.ToHexString(SHA256.HashData(plaintext)).ToLowerInvariant();
                 if (plaintext.LongLength != item.Blob.Size
@@ -335,7 +367,7 @@ public sealed class RelayClient : IAsyncDisposable
                         Encoding.ASCII.GetBytes(digest),
                         Encoding.ASCII.GetBytes(item.Blob.Sha256.ToLowerInvariant())))
                 {
-                    throw new CryptographicException("Received blob size or SHA-256 does not match.");
+                    throw new InvalidDataException("Received blob size or SHA-256 does not match.");
                 }
                 blobPath = Path.Combine(Path.GetTempPath(), $"tapdrop-{Guid.NewGuid():N}");
                 await File.WriteAllBytesAsync(blobPath, plaintext, cancellationToken);
@@ -344,26 +376,18 @@ public sealed class RelayClient : IAsyncDisposable
 
             await (_handler?.Invoke(new ReceivedItem(id, from, item, blobPath)) ?? Task.CompletedTask);
             await SendAckAsync(socket, id, cancellationToken);
-            if (shouldDeleteBlob) await DeleteBlobAsync(item.Blob!.Id, cancellationToken);
+            if (blobIdToDelete is not null) await DeleteBlobAsync(blobIdToDelete, cancellationToken);
             if (blobPath is not null && File.Exists(blobPath)) File.Delete(blobPath);
         }
-        catch (Exception error) when (error is CryptographicException or JsonException or InvalidDataException or HttpRequestException)
+        catch (Exception error) when (
+            error is CryptographicException or JsonException or InvalidDataException or PermanentMessageException)
         {
-            Console.Error.WriteLine($"Dropped TapDrop message {id}: {error.Message}");
-            lock (_dedupeLock) ForgetId(id);
+            WriteLog($"Dropped TapDrop message {id}: {error.Message}");
             await SendAckAsync(socket, id, cancellationToken);
-            if (shouldDeleteBlob && frame.TryGetProperty("env", out var envelopeElement))
+            if (blobIdToDelete is not null)
             {
-                try
-                {
-                    var item = TapDropCrypto.DecryptItem(
-                        _pair,
-                        from,
-                        id,
-                        envelopeElement.Deserialize<Envelope>(ProtocolJson.Options)!);
-                    if (item.Blob is not null) await DeleteBlobAsync(item.Blob.Id, cancellationToken);
-                }
-                catch { }
+                try { await DeleteBlobAsync(blobIdToDelete, cancellationToken); }
+                catch (Exception cleanupError) { WriteLog($"TapDrop blob cleanup failed: {cleanupError.Message}"); }
             }
             if (blobPath is not null && File.Exists(blobPath)) File.Delete(blobPath);
         }
@@ -408,12 +432,14 @@ public sealed class RelayClient : IAsyncDisposable
     private async Task PingLoopAsync(ClientWebSocket socket, CancellationToken cancellationToken)
     {
         Volatile.Write(ref _lastPongTicks, DateTime.UtcNow.Ticks);
+        var pingInterval = ReadPingSetting("TAPDROP_PING_INTERVAL_SECONDS", 25);
+        var pongTimeout = ReadPingSetting("TAPDROP_PONG_TIMEOUT_SECONDS", 10);
         while (!cancellationToken.IsCancellationRequested)
         {
-            await Task.Delay(TimeSpan.FromSeconds(25), cancellationToken);
+            await Task.Delay(pingInterval, cancellationToken);
             await SendFrameAsync(socket, "{\"t\":\"ping\"}", cancellationToken);
             var pingTicks = DateTime.UtcNow.Ticks;
-            await Task.Delay(TimeSpan.FromSeconds(10), cancellationToken);
+            await Task.Delay(pongTimeout, cancellationToken);
             if (Volatile.Read(ref _lastPongTicks) < pingTicks) throw new TimeoutException("Relay pong timed out.");
         }
     }
@@ -439,7 +465,8 @@ public sealed class RelayClient : IAsyncDisposable
     {
         using var request = new HttpRequestMessage(HttpMethod.Delete, PairUri($"/blobs/{blobId}"));
         request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _pair.AuthToken);
-        using var response = await _httpClient.SendAsync(request, cancellationToken);
+        using var timeout = CreateRequestTimeout(cancellationToken, StandardRequestTimeout);
+        using var response = await _httpClient.SendAsync(request, timeout.Token);
         response.EnsureSuccessStatusCode();
     }
 
@@ -459,8 +486,30 @@ public sealed class RelayClient : IAsyncDisposable
 
     private void SetConnection(bool connected, bool peerOnline)
     {
-        try { ConnectionChanged?.Invoke(connected, peerOnline); } catch (Exception error) { Console.Error.WriteLine(error); }
+        try { ConnectionChanged?.Invoke(connected, peerOnline); } catch (Exception error) { WriteLog(error.ToString()); }
     }
+
+    private void WriteLog(string message)
+    {
+        try
+        {
+            if (Log is { } log) log(message);
+            else Console.Error.WriteLine(message);
+        }
+        catch { }
+    }
+
+    private static CancellationTokenSource CreateRequestTimeout(CancellationToken cancellationToken, TimeSpan timeout)
+    {
+        var source = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        source.CancelAfter(timeout);
+        return source;
+    }
+
+    private static TimeSpan ReadPingSetting(string name, int defaultSeconds) =>
+        int.TryParse(Environment.GetEnvironmentVariable(name), out var seconds) && seconds > 0
+            ? TimeSpan.FromSeconds(seconds)
+            : TimeSpan.FromSeconds(defaultSeconds);
 
     private void RememberId(string id)
     {
@@ -497,6 +546,7 @@ public sealed class RelayClient : IAsyncDisposable
         try { await task; } catch (OperationCanceledException) { } catch (WebSocketException) { }
     }
 
+    private sealed class PermanentMessageException(string message) : Exception(message) { }
     private long _lastPongTicks;
     private sealed record SendFrame(string T, string Id, Envelope Env);
     private sealed record AckFrame(string T, string Id);

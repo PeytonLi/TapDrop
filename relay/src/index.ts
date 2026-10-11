@@ -116,8 +116,9 @@ export class PairDO extends DurableObject<Env> {
     const pair = new WebSocketPair();
     const client = pair[0];
     const server = pair[1];
-    for (const old of this.ctx.getWebSockets(role)) old.close(4000, "Replaced by a new connection");
+    const replaced = this.ctx.getWebSockets(role);
     this.ctx.acceptWebSocket(server, [role]);
+    for (const old of replaced) old.close(4000, "Replaced by a new connection");
 
     const peerOnline = this.ctx.getWebSockets(otherRole(role)).length > 0;
     server.send(JSON.stringify({ t: "hello", protocol: 1, peerOnline }));
@@ -203,14 +204,16 @@ export class PairDO extends DurableObject<Env> {
     });
   }
 
-  webSocketClose(ws: WebSocket, _code: number, _reason: string, _wasClean: boolean): void {
+  webSocketClose(ws: WebSocket, code: number, reason: string, _wasClean: boolean): void {
     const role = this.socketRole(ws);
-    this.broadcast(otherRole(role), { t: "presence", peerOnline: this.ctx.getWebSockets(role).length > 0 });
+    this.completeClose(ws, code, reason);
+    this.broadcast(otherRole(role), { t: "presence", peerOnline: this.hasOtherOpenSocket(role, ws) });
   }
 
   webSocketError(ws: WebSocket, _error: unknown): void {
     const role = this.socketRole(ws);
-    this.broadcast(otherRole(role), { t: "presence", peerOnline: this.ctx.getWebSockets(role).length > 0 });
+    this.completeClose(ws, 1011, "WebSocket error");
+    this.broadcast(otherRole(role), { t: "presence", peerOnline: this.hasOtherOpenSocket(role, ws) });
   }
 
   async alarm(): Promise<void> {
@@ -344,6 +347,16 @@ export class PairDO extends DurableObject<Env> {
   private socketRole(ws: WebSocket): Role {
     const role = this.ctx.getTags(ws)[0];
     return role === "phone" ? "phone" : "laptop";
+  }
+
+  private hasOtherOpenSocket(role: Role, closing: WebSocket): boolean {
+    return this.ctx.getWebSockets(role).some((socket) => socket !== closing && socket.readyState === WebSocket.OPEN);
+  }
+
+  private completeClose(ws: WebSocket, code: number, reason: string): void {
+    try {
+      if (ws.readyState !== WebSocket.CLOSED) ws.close(code, reason);
+    } catch {}
   }
 
   private broadcast(role: Role, frame: object): void {

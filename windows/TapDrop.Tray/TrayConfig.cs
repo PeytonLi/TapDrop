@@ -59,3 +59,19 @@ internal static class ConfigStore
         File.WriteAllText(ConfigPath, json, Encoding.UTF8);
     }
 }
+
+internal static class TrayLog
+{
+    private static readonly object Sync = new();
+
+    public static void Write(string message)
+    {
+        try
+        {
+            Directory.CreateDirectory(ConfigStore.DirectoryPath);
+            var line = $"{DateTimeOffset.Now:O} {message}{Environment.NewLine}";
+            lock (Sync) File.AppendAllText(Path.Combine(ConfigStore.DirectoryPath, "tray.log"), line, Encoding.UTF8);
+        }
+        catch { }
+    }
+}

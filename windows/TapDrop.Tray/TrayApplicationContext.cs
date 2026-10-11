@@ -31,6 +31,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
     private PairDialog? _pairDialog;
     private bool _connected;
     private bool _peerOnline;
+    private bool _isExiting;
 
     public TrayApplicationContext(string[] args)
     {
@@ -38,16 +39,17 @@ internal sealed class TrayApplicationContext : ApplicationContext
         _host = new HotkeyForm();
         _host.HotkeyPressed += (_, _) => _ = SendClipboardAsync();
         _ = _host.Handle;
-        RegisterHotKey(_host.Handle, HotkeyId, ModControl | ModAlt, VkP);
+        var hotkeyRegistered = RegisterHotKey(_host.Handle, HotkeyId, ModControl | ModAlt, VkP);
 
         var menu = new ContextMenuStrip();
         menu.Items.Add("Send clipboard\tCtrl+Alt+P", null, async (_, _) => await SendClipboardAsync());
         menu.Items.Add("Send files…", null, async (_, _) => await PickAndSendFilesAsync());
         _recentMenu = new ToolStripMenuItem("Recent");
+        _recentMenu.DropDownItems.Add(new ToolStripMenuItem("(none)") { Enabled = false });
         menu.Items.Add(_recentMenu);
         menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add("Pair phone…", null, async (_, _) => await PairPhoneAsync());
-        menu.Items.Add("Settings…", null, (_, _) => ShowSettings());
+        menu.Items.Add("Pair phone…", null, async (_, _) => await RunSafelyAsync(PairPhoneAsync));
+        menu.Items.Add("Settings…", null, async (_, _) => await RunSafelyAsync(ShowSettingsAsync));
         _autoOpenMenu = new ToolStripMenuItem("Auto-open links") { CheckOnClick = true, Checked = _config.AutoOpenLinks };
         _autoOpenMenu.CheckedChanged += (_, _) =>
         {
@@ -65,7 +67,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
         menu.Items.Add(_startupMenu);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Open TapDrop folder", null, (_, _) => OpenPath(ConfigStore.DirectoryPath));
-        menu.Items.Add("Unpair", null, async (_, _) => await UnpairAsync());
+        menu.Items.Add("Unpair", null, async (_, _) => await RunSafelyAsync(UnpairAsync));
         menu.Items.Add("Quit", null, (_, _) => ExitThread());
 
         _icon = new NotifyIcon
@@ -75,7 +77,8 @@ internal sealed class TrayApplicationContext : ApplicationContext
             ContextMenuStrip = menu,
             Visible = true,
         };
-        _icon.DoubleClick += (_, _) => ShowSettings();
+        _icon.DoubleClick += async (_, _) => await RunSafelyAsync(ShowSettingsAsync);
+        if (!hotkeyRegistered) ShowToast("TapDrop", "Ctrl+Alt+P is already used by another app");
         ToastNotificationManagerCompat.OnActivated += ToastActivated;
         SetStartWithWindows(_config.StartWithWindows);
         CreateSendToShortcut();
@@ -88,18 +91,34 @@ internal sealed class TrayApplicationContext : ApplicationContext
     private async void InitializeOnIdle(object? sender, EventArgs eventArgs)
     {
         Application.Idle -= InitializeOnIdle;
-        await InitializeAsync();
+        try { await InitializeAsync(); }
+        catch (Exception error)
+        {
+            TrayLog.Write(error.ToString());
+            ShowToast("TapDrop", error.Message);
+        }
     }
 
     protected override void ExitThreadCore()
     {
+        _isExiting = true;
         _pipeCancellation.Cancel();
         _icon.Visible = false;
         _icon.Dispose();
         UnregisterHotKey(_host.Handle, HotkeyId);
         _host.Close();
         _host.Dispose();
-        _client?.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        var client = _client;
+        _client = null;
+        if (client is not null)
+        {
+            try
+            {
+                if (!client.DisposeAsync().AsTask().Wait(TimeSpan.FromSeconds(2)))
+                    TrayLog.Write("Timed out while stopping the relay client during exit.");
+            }
+            catch (Exception error) { TrayLog.Write(error.ToString()); }
+        }
         _pipeCancellation.Dispose();
         base.ExitThreadCore();
     }
@@ -108,21 +127,22 @@ internal sealed class TrayApplicationContext : ApplicationContext
     {
         if (string.IsNullOrWhiteSpace(_config.RelayUrl))
         {
-            ShowSettings();
+            await ShowSettingsAsync();
             if (string.IsNullOrWhiteSpace(_config.RelayUrl)) return;
         }
         if (_config.IsPaired) await RestartClientAsync();
         else UpdateIcon();
     }
 
-    private void ShowSettings()
+    private async Task ShowSettingsAsync()
     {
         var oldRelay = _config.RelayUrl;
         var oldName = _config.DeviceName;
         using var dialog = new SettingsDialog(_config);
         if (dialog.ShowDialog(_host) != DialogResult.OK) return;
         ConfigStore.Save(_config);
-        if (_config.IsPaired && (oldRelay != _config.RelayUrl || oldName != _config.DeviceName)) _ = RestartClientAsync();
+        if (_config.IsPaired && (oldRelay != _config.RelayUrl || oldName != _config.DeviceName))
+            await RestartClientAsync();
         UpdateIcon();
     }
 
@@ -130,12 +150,12 @@ internal sealed class TrayApplicationContext : ApplicationContext
     {
         if (string.IsNullOrWhiteSpace(_config.RelayUrl))
         {
-            ShowSettings();
+            await ShowSettingsAsync();
             if (string.IsNullOrWhiteSpace(_config.RelayUrl)) return;
         }
 
         var pair = PairInfo.Generate(_config.RelayUrl, _config.DeviceName);
-        await using var registering = new RelayClient(pair);
+        await using var registering = new RelayClient(pair) { Log = TrayLog.Write };
         await registering.RegisterAsync();
         _config.SetPair(pair);
         ConfigStore.Save(_config);
@@ -162,7 +182,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
         }
 
         var info = pair ?? _config.ToPairInfo();
-        _client = new RelayClient(info);
+        _client = new RelayClient(info) { Log = TrayLog.Write };
         _client.ConnectionChanged += (connected, peerOnline) => RunOnUi(() =>
         {
             _connected = connected;
@@ -174,7 +194,6 @@ internal sealed class TrayApplicationContext : ApplicationContext
             }
         });
         _client.Delivered += id => RunOnUi(() => _icon.Text = ClipTooltip($"TapDrop — delivered {id[..Math.Min(8, id.Length)]}"));
-        await _client.RegisterAsync();
         await _client.StartAsync("laptop", HandleReceivedAsync);
         UpdateIcon();
         if (_pendingSendPaths.Count > 0)
@@ -211,7 +230,8 @@ internal sealed class TrayApplicationContext : ApplicationContext
                 {
                     var path = SaveReceivedBlob(received, Environment.GetFolderPath(Environment.SpecialFolder.MyPictures), "TapDrop");
                     using var image = Image.FromFile(path);
-                    Clipboard.SetImage(new Bitmap(image));
+                    using var bitmap = new Bitmap(image);
+                    Clipboard.SetImage(bitmap);
                     AddRecent(new RecentEntry("image", path, path, received.Item.Sender ?? "Phone"));
                     ShowImageToast(path);
                     break;
@@ -390,7 +410,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
                 else if (action == "open") OpenPath(target);
             });
         }
-        catch (Exception error) { Console.Error.WriteLine(error); }
+        catch (Exception error) { TrayLog.Write(error.ToString()); }
     }
 
     private string SaveReceivedBlob(ReceivedItem item, string root, string subdirectory)
@@ -467,7 +487,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
             Marshal.FinalReleaseComObject(shortcut);
             Marshal.FinalReleaseComObject(shell);
         }
-        catch (Exception error) { Console.Error.WriteLine(error); }
+        catch (Exception error) { TrayLog.Write(error.ToString()); }
     }
 
     private async Task StartPipeServerAsync(CancellationToken cancellationToken)
@@ -485,7 +505,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
                 RunOnUi(() => HandleForwardedArguments(args));
             }
             catch (OperationCanceledException) { break; }
-            catch (Exception error) { Console.Error.WriteLine(error); }
+            catch (Exception error) { TrayLog.Write(error.ToString()); }
         }
     }
 
@@ -513,26 +533,66 @@ internal sealed class TrayApplicationContext : ApplicationContext
 
     private Task InvokeAsync(Action action)
     {
-        if (_host.IsDisposed) return Task.CompletedTask;
+        if (_isExiting || _host.IsDisposed || _host.Disposing)
+            return Task.FromException(new OperationCanceledException("The tray is shutting down."));
         if (!_host.InvokeRequired)
         {
             action();
             return Task.CompletedTask;
         }
         var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        _host.BeginInvoke(new Action(() =>
+        EventHandler? disposed = null;
+        disposed = (_, _) => completion.TrySetException(new OperationCanceledException("The tray is shutting down."));
+        _host.Disposed += disposed;
+        try
         {
-            try { action(); completion.SetResult(); }
-            catch (Exception error) { completion.SetException(error); }
-        }));
+            if (_isExiting || _host.IsDisposed || _host.Disposing)
+            {
+                _host.Disposed -= disposed;
+                completion.TrySetException(new OperationCanceledException("The tray is shutting down."));
+            }
+            else
+            {
+                _host.BeginInvoke(new Action(() =>
+                {
+                    _host.Disposed -= disposed;
+                    if (_isExiting || _host.IsDisposed || _host.Disposing)
+                    {
+                        completion.TrySetException(new OperationCanceledException("The tray is shutting down."));
+                        return;
+                    }
+                    try { action(); completion.TrySetResult(); }
+                    catch (Exception error) { completion.TrySetException(error); }
+                }));
+            }
+        }
+        catch (InvalidOperationException error)
+        {
+            _host.Disposed -= disposed;
+            completion.TrySetException(new OperationCanceledException("The tray is shutting down.", error));
+        }
         return completion.Task;
     }
 
     private void RunOnUi(Action action)
     {
-        if (_host.IsDisposed) return;
-        if (_host.InvokeRequired) _host.BeginInvoke(action);
-        else action();
+        if (_isExiting || _host.IsDisposed || _host.Disposing) return;
+        try
+        {
+            if (_host.InvokeRequired) _host.BeginInvoke(action);
+            else action();
+        }
+        catch (InvalidOperationException) { }
+    }
+
+    private async Task RunSafelyAsync(Func<Task> action)
+    {
+        try { await action(); }
+        catch (Exception error)
+        {
+            TrayLog.Write(error.ToString());
+            ShowToast("TapDrop", error.Message);
+        }
     }
 
     private static void OpenPath(string path)

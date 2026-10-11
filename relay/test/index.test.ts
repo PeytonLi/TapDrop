@@ -184,6 +184,21 @@ describe("relay WebSocket delivery", () => {
     expect((await nextFrame(phone)).id).toBe(ids[1]);
   });
 
+  it("keeps a peer online while replacing a same-role socket", async () => {
+    const id = pairId();
+    await register(id);
+    const phone = await connectedSocket(id, "phone");
+    expect(await nextFrame(phone)).toMatchObject({ t: "hello", peerOnline: false });
+
+    const firstLaptop = await connectedSocket(id, "laptop");
+    expect(await nextFrame(firstLaptop)).toMatchObject({ t: "hello", peerOnline: true });
+    expect(await nextFrame(phone)).toEqual({ t: "presence", peerOnline: true });
+
+    const replacement = await connectedSocket(id, "laptop");
+    expect(await nextFrame(replacement)).toMatchObject({ t: "hello", peerOnline: true });
+    expect(await nextFrame(phone)).toEqual({ t: "presence", peerOnline: true });
+  });
+
   it("reports duplicate ids, oversized frames and a full recipient queue", async () => {
     const id = pairId();
     await register(id);
