@@ -13,6 +13,9 @@ internal sealed class TrayConfig
     public string DeviceName { get; set; } = Environment.MachineName;
     public bool AutoOpenLinks { get; set; }
     public bool StartWithWindows { get; set; } = true;
+    public bool KnockToSend { get; set; }
+    public int KnockSensitivity { get; set; } = 5;
+    public string PhoneName { get; set; } = "";
 
     public bool IsPaired => !string.IsNullOrWhiteSpace(PairId) && !string.IsNullOrWhiteSpace(ProtectedMasterKey);
 
