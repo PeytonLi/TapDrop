@@ -1,0 +1,14 @@
+name = "tapdrop-relay"
+main = "src/index.ts"
+compatibility_date = "2025-09-06"
+
+[vars]
+MAX_BLOB_BYTES = "104857600"
+
+[[durable_objects.bindings]]
+name = "PAIRS"
+class_name = "PairDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["PairDO"]
