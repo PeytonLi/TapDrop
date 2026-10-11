@@ -39,7 +39,7 @@ internal sealed class KnockListener : IDisposable
         {
             waveIn = new WaveInEvent
             {
-                DeviceNumber = 0,
+                DeviceNumber = -1,
                 WaveFormat = new WaveFormat(16000, 16, 1),
                 BufferMilliseconds = 50,
             };
