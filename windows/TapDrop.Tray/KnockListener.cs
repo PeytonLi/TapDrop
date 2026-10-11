@@ -77,14 +77,16 @@ internal sealed class KnockListener : IDisposable
     {
         var count = eventArgs.BytesRecorded / sizeof(short);
         var samples = new float[count];
+        var peak = 0f;
         for (var index = 0; index < count; index++)
         {
             var value = BinaryPrimitives.ReadInt16LittleEndian(eventArgs.Buffer.AsSpan(index * sizeof(short), sizeof(short)));
             samples[index] = value / 32768f;
+            peak = Math.Max(peak, Math.Abs(samples[index]));
         }
 
         var events = _detector.Process(samples);
-        Level?.Invoke(_detector.CurrentLevelDbfs, _detector.NoiseFloorDbfs);
+        Level?.Invoke(peak > 0 ? Math.Max(-100, 20 * Math.Log10(peak)) : -100, _detector.NoiseFloorDbfs);
         foreach (var knockEvent in events)
         {
             if (knockEvent.Kind == KnockEventKind.Transient) Transient?.Invoke(knockEvent);

@@ -19,7 +19,7 @@ internal sealed class SettingsDialog : Form
     private readonly Label _sensitivityLabel = new() { AutoSize = true };
     private readonly Button _testButton = new() { Text = "Start test", AutoSize = true };
     private readonly ProgressBar _levelMeter = new() { Minimum = 0, Maximum = 80, Dock = DockStyle.Fill };
-    private readonly Label _levelLabel = new() { AutoSize = true, Text = "Level: -100 dBFS · Noise floor: -80 dBFS" };
+    private readonly Label _levelLabel = new() { AutoSize = true, Text = "Peak: -100 dBFS · Noise floor: -80 dBFS" };
     private readonly ListBox _eventLog = new() { Dock = DockStyle.Fill };
     private KnockListener? _testListener;
     private long _lastMeterTick;
@@ -133,7 +133,7 @@ internal sealed class SettingsDialog : Form
             RunOnUi(() =>
             {
                 _levelMeter.Value = Math.Clamp((int)Math.Round(level + 80), _levelMeter.Minimum, _levelMeter.Maximum);
-                _levelLabel.Text = $"Level: {level:0} dBFS · Noise floor: {floor:0} dBFS";
+                _levelLabel.Text = $"Peak: {level:0} dBFS · Noise floor: {floor:0} dBFS";
             });
         };
         if (!listener.Start(out var error))
