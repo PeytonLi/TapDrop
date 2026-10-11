@@ -27,6 +27,7 @@ import android.provider.MediaStore
 import android.provider.OpenableColumns
 import android.widget.Toast
 import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import androidx.core.content.IntentCompat
@@ -155,16 +156,21 @@ class RelayService : Service() {
     private suspend fun sendSharedContent(intent: Intent) {
         val saved = pairing ?: pairingStorage.load()
         val relayClient = client
+        val source = intent.getStringExtra(EXTRA_SOURCE) ?: "share"
+        val tile = source == "tile"
         if (saved == null || relayClient == null) {
-            showToast("Pair TapDrop with your laptop first")
+            if (tile) postTileFeedback(this, "Couldn't send", "Pair TapDrop with your laptop first")
+            else showToast("Pair TapDrop with your laptop first")
             stopSelf()
             return
         }
-        val source = intent.getStringExtra(EXTRA_SOURCE) ?: "share"
         val text = intent.getCharSequenceExtra(Intent.EXTRA_TEXT)?.toString()
         val uris = IntentCompat.getParcelableArrayListExtra(intent, EXTRA_URIS, Uri::class.java).orEmpty()
         val disconnected = !relayClient.connectionState.value.connected
-        if (disconnected) showToast("Queued — will send when online")
+        if (disconnected) {
+            if (tile) postTileFeedback(this, "Queued", "Will send when ${saved.laptopName} is online")
+            else showToast("Queued — will send when online")
+        }
         try {
             if (!text.isNullOrBlank()) {
                 val parsed = ShareText.parse(text)
@@ -179,10 +185,14 @@ class RelayService : Service() {
                     cached.file.delete()
                 }
             }
-            if (!disconnected) showToast("Sent to ${saved.laptopName}")
+            if (!disconnected) {
+                if (tile) postTileFeedback(this, "Sent ✓", "Clipboard sent to ${saved.laptopName}")
+                else showToast("Sent to ${saved.laptopName}")
+            }
         } catch (error: Exception) {
             android.util.Log.e("TapDrop", "Sending shared content failed", error)
-            showToast(error.message ?: "TapDrop could not send the item")
+            if (tile) postTileFeedback(this, "Couldn't send", error.message ?: "TapDrop could not send the item")
+            else showToast(error.message ?: "TapDrop could not send the item")
         }
     }
 
@@ -387,7 +397,10 @@ class RelayService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
         val copy = PendingIntent.getBroadcast(
-            this, id + 1, Intent(this, CopyTextReceiver::class.java).putExtra(EXTRA_COPY_TEXT, url),
+            this, id + 1,
+            Intent(this, CopyTextReceiver::class.java)
+                .putExtra(EXTRA_COPY_TEXT, url)
+                .putExtra(EXTRA_NOTIFICATION_ID, id),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
         val notification = NotificationCompat.Builder(this, RECEIVED_CHANNEL)
@@ -395,6 +408,7 @@ class RelayService : Service() {
             .setContentTitle("Link from $laptopName")
             .setContentText(url)
             .setContentIntent(open)
+            .addAction(0, "Open", open)
             .addAction(0, "Copy", copy)
             .setAutoCancel(true)
             .build()
@@ -452,9 +466,7 @@ class RelayService : Service() {
     }
 
     private fun createChannels() {
-        val manager = getSystemService(NotificationManager::class.java)
-        manager.createNotificationChannel(NotificationChannel(STATUS_CHANNEL, "TapDrop connection", NotificationManager.IMPORTANCE_LOW))
-        manager.createNotificationChannel(NotificationChannel(RECEIVED_CHANNEL, "Received items", NotificationManager.IMPORTANCE_HIGH))
+        ensureChannels(this)
     }
 
     private fun startForegroundStatus() {
@@ -494,13 +506,37 @@ class RelayService : Service() {
         const val EXTRA_SOURCE = "source"
         const val EXTRA_URIS = "uris"
         const val EXTRA_COPY_TEXT = "copyText"
+        const val EXTRA_NOTIFICATION_ID = "notificationId"
         private const val STATUS_CHANNEL = "tapdrop-status"
         private const val RECEIVED_CHANNEL = "tapdrop-received"
         private const val STATUS_ID = 1201
+        private const val TILE_FEEDBACK_ID = 1202
         private const val MAX_BLOB_BYTES = 95L * 1024 * 1024
         private val URL_SCHEME = Regex("^[A-Za-z][A-Za-z0-9+.-]*:")
         private val _status = MutableStateFlow(RelayConnectionState())
         val status = _status.asStateFlow()
+
+        fun ensureChannels(context: Context) {
+            val manager = context.getSystemService(NotificationManager::class.java)
+            manager.createNotificationChannel(NotificationChannel(STATUS_CHANNEL, "TapDrop connection", NotificationManager.IMPORTANCE_LOW))
+            manager.createNotificationChannel(NotificationChannel(RECEIVED_CHANNEL, "Received items", NotificationManager.IMPORTANCE_HIGH))
+        }
+
+        fun postTileFeedback(context: Context, title: String, text: String) {
+            if (Build.VERSION.SDK_INT >= 33 &&
+                ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED
+            ) return
+            ensureChannels(context)
+            val notification = NotificationCompat.Builder(context, STATUS_CHANNEL)
+                .setSmallIcon(android.R.drawable.stat_sys_upload_done)
+                .setContentTitle(title)
+                .setContentText(text)
+                .setTimeoutAfter(3_000)
+                .setAutoCancel(true)
+                .setOnlyAlertOnce(true)
+                .build()
+            NotificationManagerCompat.from(context).notify(TILE_FEEDBACK_ID, notification)
+        }
 
         fun start(context: Context) {
             ContextCompat.startForegroundService(context, Intent(context, RelayService::class.java).setAction(ACTION_START))
@@ -534,6 +570,9 @@ class CopyTextReceiver : android.content.BroadcastReceiver() {
         val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
         clipboard.setPrimaryClip(android.content.ClipData.newPlainText("TapDrop", text))
         Toast.makeText(context, "Copied to clipboard", Toast.LENGTH_SHORT).show()
+        if (intent.hasExtra(RelayService.EXTRA_NOTIFICATION_ID)) {
+            NotificationManagerCompat.from(context).cancel(intent.getIntExtra(RelayService.EXTRA_NOTIFICATION_ID, 0))
+        }
     }
 }
 
