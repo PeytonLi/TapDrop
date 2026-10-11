@@ -66,13 +66,15 @@ raise SystemExit("laptop listener did not connect")
 PY
 
 mkdir -p "$TMP/android-files"
-dd if=/dev/urandom of="$TMP/laptop-to-android-5m.bin" bs=1M count=5 status=none
+dd if=/dev/urandom of="$TMP/android-to-laptop-90m.bin" bs=1M count=90 status=none
+dd if=/dev/urandom of="$TMP/laptop-to-android-90m.bin" bs=1M count=90 status=none
 cd "$ROOT/android"
 ./gradlew :app:testDebugUnitTest \
   -PtapdropInteropE2E=true \
   -PinteropQr="$QR" \
   -PinteropDir="$TMP" \
-  -PinteropLaptopFile="$TMP/laptop-to-android-5m.bin" \
+  -PinteropPhoneFile="$TMP/android-to-laptop-90m.bin" \
+  -PinteropLaptopFile="$TMP/laptop-to-android-90m.bin" \
   --tests dev.peytonli.tapdrop.core.InteropE2ETest >"$TMP/android-test.log" 2>&1 &
 PHONE_TEST_PID=$!
 cd "$ROOT"
@@ -81,7 +83,7 @@ python3 - "$TMP" "$PHONE_TEST_PID" <<'PY'
 import os, subprocess, sys, time
 directory, pid = sys.argv[1:]
 marker = os.path.join(directory, "android-sent")
-for _ in range(900):
+for _ in range(1200):
     if os.path.exists(marker):
         raise SystemExit(0)
     try:
@@ -100,9 +102,9 @@ path = sys.argv[1]
 expected = {
     ("text", "android-to-laptop-text"),
     ("url", "https://example.com/tapdrop-android-e2e"),
-    ("file", "android-to-laptop-5m.bin"),
+    ("file", "android-to-laptop-90m.bin"),
 }
-for _ in range(300):
+for _ in range(900):
     found = set()
     try:
         lines = open(path, errors="replace").read().splitlines()
@@ -125,14 +127,14 @@ for _ in range(300):
 print(open(path, errors="replace").read() if os.path.exists(path) else "")
 raise SystemExit("laptop listener did not receive all Android items")
 PY
-cmp "$TMP/android-to-laptop-5m.bin" "$TMP/laptop-files/android-to-laptop-5m.bin"
+cmp "$TMP/android-to-laptop-90m.bin" "$TMP/laptop-files/android-to-laptop-90m.bin"
 
 dotnet "$CLI" send-text --config "$TMP/laptop.json" --role laptop --text "laptop-to-android-text"
-dotnet "$CLI" send-file --config "$TMP/laptop.json" --role laptop --path "$TMP/laptop-to-android-5m.bin" --mime application/octet-stream
+dotnet "$CLI" send-file --config "$TMP/laptop.json" --role laptop --path "$TMP/laptop-to-android-90m.bin" --mime application/octet-stream
 if ! wait "$PHONE_TEST_PID"; then
   cat "$TMP/android-test.log"
   exit 1
 fi
 PHONE_TEST_PID=""
 
-echo "ANDROID E2E PASS: phone-to-laptop text, URL, 5 MiB byte-exact file; laptop-to-phone text and 5 MiB byte-exact file"
+echo "ANDROID E2E PASS: phone-to-laptop text, URL, 90 MiB byte-exact file; laptop-to-phone text and 90 MiB byte-exact file"

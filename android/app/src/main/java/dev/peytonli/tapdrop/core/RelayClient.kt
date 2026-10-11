@@ -1,7 +1,10 @@
 package dev.peytonli.tapdrop.core
 
+import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.IOException
+import java.io.InputStream
+import java.io.OutputStreamWriter
 import java.net.HttpURLConnection
 import java.net.SocketTimeoutException
 import java.security.GeneralSecurityException
@@ -44,11 +47,13 @@ import kotlinx.serialization.json.putJsonObject
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.asRequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import org.bouncycastle.crypto.InvalidCipherTextException
 
 data class RelayConnectionState(val connected: Boolean = false, val peerOnline: Boolean = false)
 
@@ -120,13 +125,22 @@ class RelayClient(
 
     suspend fun sendText(text: String, source: String = "share"): SendReceipt {
         checkStarted()
-        val bytes = text.toByteArray(Charsets.UTF_8)
-        val item = if (bytes.size <= INLINE_TEXT_BYTES) {
+        val inlineBytes = if (text.length <= INLINE_TEXT_BYTES) text.toByteArray(Charsets.UTF_8) else null
+        val item = if (inlineBytes != null && inlineBytes.size <= INLINE_TEXT_BYTES) {
             newItem(kind = "text", source = source, text = text)
         } else {
-            newItem(kind = "text", source = source).copy(
-                blob = uploadBlob(bytes, "text.txt", "text/plain"),
-            )
+            cacheDirectory.mkdirs()
+            val textFile = File.createTempFile("tapdrop-text-", ".txt", cacheDirectory)
+            try {
+                withContext(Dispatchers.IO) {
+                    OutputStreamWriter(textFile.outputStream(), Charsets.UTF_8).use { it.write(text) }
+                }
+                newItem(kind = "text", source = source).copy(
+                    blob = uploadBlob(textFile, "text.txt", "text/plain"),
+                )
+            } finally {
+                textFile.delete()
+            }
         }
         return sendItem(item)
     }
@@ -140,9 +154,8 @@ class RelayClient(
         checkStarted()
         require(file.isFile) { "File to send was not found." }
         require(file.length() <= MAX_PLAINTEXT_BLOB_BYTES) { "TapDrop files are limited to 95 MiB." }
-        val bytes = withContext(Dispatchers.IO) { file.readBytes() }
         val contentType = mime ?: mimeFor(file.extension)
-        val blob = uploadBlob(bytes, file.name, contentType)
+        val blob = uploadBlob(file, file.name, contentType)
         return sendItem(newItem(
             kind = if (contentType.startsWith("image/", ignoreCase = true)) "image" else kind,
             source = source,
@@ -212,6 +225,45 @@ class RelayClient(
 
     internal suspend fun uploadBlob(plaintext: ByteArray, name: String, mime: String): BlobRef {
         require(plaintext.size <= MAX_PLAINTEXT_BLOB_BYTES) { "TapDrop blobs are limited to 95 MiB." }
+        return prepareAndUploadBlob(name, mime) { ByteArrayInputStream(plaintext) }
+    }
+
+    private suspend fun uploadBlob(file: File, name: String, mime: String): BlobRef {
+        require(file.isFile) { "File to send was not found." }
+        require(file.length() <= MAX_PLAINTEXT_BLOB_BYTES) { "TapDrop blobs are limited to 95 MiB." }
+        return prepareAndUploadBlob(name, mime) { file.inputStream() }
+    }
+
+    private suspend fun prepareAndUploadBlob(
+        name: String,
+        mime: String,
+        openInput: () -> InputStream,
+    ): BlobRef {
+        val id = TapDropCrypto.toBase64Url(ByteArray(16).also(java.security.SecureRandom()::nextBytes))
+        cacheDirectory.mkdirs()
+        val encryptedFile = File.createTempFile("tapdrop-encrypted-", ".blob", cacheDirectory)
+        try {
+            val result = withContext(Dispatchers.IO) {
+                openInput().buffered().use { input ->
+                    encryptedFile.outputStream().buffered().use { output ->
+                        TapDropCrypto.encryptBlobStream(pair, id, input, output)
+                    }
+                }
+            }
+            require(result.plainSize <= MAX_PLAINTEXT_BLOB_BYTES) { "TapDrop blobs are limited to 95 MiB." }
+            return retryUpload(encryptedFile, id, name, mime, result)
+        } finally {
+            encryptedFile.delete()
+        }
+    }
+
+    private suspend fun retryUpload(
+        encryptedFile: File,
+        id: String,
+        name: String,
+        mime: String,
+        result: BlobStreamResult,
+    ): BlobRef {
         val startedAt = System.nanoTime()
         var backoffMillis = 1000L
         var lastError: Exception? = null
@@ -221,7 +273,7 @@ class RelayClient(
             if (remainingNanos <= 0) throw lastError ?: IOException("Blob upload retry window expired.")
             try {
                 val timeoutMillis = minOf(BLOB_TIMEOUT, TimeUnit.NANOSECONDS.toMillis(remainingNanos).coerceAtLeast(1))
-                return uploadBlobAttempt(plaintext, name, mime, timeoutMillis)
+                return uploadBlobAttempt(encryptedFile, id, name, mime, result, timeoutMillis)
             } catch (error: kotlinx.coroutines.CancellationException) {
                 throw error
             } catch (error: Exception) {
@@ -252,23 +304,23 @@ class RelayClient(
     }
 
     private suspend fun uploadBlobAttempt(
-        plaintext: ByteArray,
+        encryptedFile: File,
+        id: String,
         name: String,
         mime: String,
+        result: BlobStreamResult,
         timeoutMillis: Long,
     ): BlobRef {
-        val id = TapDropCrypto.toBase64Url(ByteArray(16).also(java.security.SecureRandom()::nextBytes))
-        val encrypted = TapDropCrypto.encryptBlob(pair, id, plaintext)
         val request = Request.Builder()
             .url(pairUrl("/blobs/$id"))
             .header("Authorization", "Bearer ${pair.authToken}")
-            .put(encrypted.toRequestBody("application/octet-stream".toMediaType()))
+            .put(encryptedFile.asRequestBody("application/octet-stream".toMediaType()))
             .build()
         execute(request, timeoutMillis).use { response ->
             if (response.code != HttpURLConnection.HTTP_CREATED)
                 throw RelayHttpException(response.code, "Blob upload failed")
         }
-        return BlobRef(id, name, mime, plaintext.size.toLong(), TapDropCrypto.sha256Hex(plaintext))
+        return BlobRef(id, name, mime, result.plainSize, result.plainSha256Hex)
     }
 
     private fun signalUploadRetries() {
@@ -400,6 +452,7 @@ class RelayClient(
 
         var blobId: String? = null
         var tempFile: File? = null
+        var encryptedTempFile: File? = null
         var decodedItem: Item? = null
         try {
             try {
@@ -439,20 +492,33 @@ class RelayClient(
                         if (response.code == HttpURLConnection.HTTP_NOT_FOUND)
                             throw PermanentMessageError("Referenced blob ${blob.id} was not found.")
                         if (!response.isSuccessful) throw RelayHttpException(response.code, "Blob download failed")
-                        val encrypted = response.body?.bytes() ?: throw IOException("Blob response has no body.")
-                        val plaintext = try {
-                            TapDropCrypto.decryptBlob(pair, blob.id, encrypted)
-                        } catch (error: IllegalArgumentException) {
+                        val body = response.body ?: throw IOException("Blob response has no body.")
+                        if (body.contentLength() > MAX_ENCRYPTED_BLOB_BYTES)
+                            throw PermanentMessageError("Encrypted blob exceeds the size limit.")
+                        cacheDirectory.mkdirs()
+                        val encryptedFile = File.createTempFile("tapdrop-encrypted-", ".blob", cacheDirectory)
+                        encryptedTempFile = encryptedFile
+                        tempFile = File.createTempFile("tapdrop-", ".blob", cacheDirectory)
+                        body.byteStream().use { input ->
+                            encryptedFile.outputStream().buffered().use { output ->
+                                copyEncryptedBlob(input, output)
+                            }
+                        }
+                        val result = try {
+                            encryptedFile.inputStream().buffered().use { input ->
+                                tempFile!!.outputStream().buffered().use { output ->
+                                    TapDropCrypto.decryptBlobStream(pair, blob.id, input, output)
+                                }
+                            }
+                        } catch (error: InvalidCipherTextException) {
                             throw PermanentMessageError("Invalid encrypted blob.", error)
                         }
-                        if (plaintext.size.toLong() != blob.size || !MessageDigest.isEqual(
-                                TapDropCrypto.sha256Hex(plaintext).toByteArray(Charsets.US_ASCII),
+                        if (result.plainSize != blob.size || !MessageDigest.isEqual(
+                                result.plainSha256Hex.toByteArray(Charsets.US_ASCII),
                                 blob.sha256.lowercase().toByteArray(Charsets.US_ASCII),
                             )
                         ) throw PermanentMessageError("Received blob size or SHA-256 does not match.")
-                        cacheDirectory.mkdirs()
-                        tempFile = File.createTempFile("tapdrop-", ".blob", cacheDirectory).apply { writeBytes(plaintext) }
-                        if (item.kind == "text") item = item.copy(text = plaintext.toString(Charsets.UTF_8))
+                        if (item.kind == "text") item = item.copy(text = tempFile!!.readText(Charsets.UTF_8))
                     }
                 }
                 decodedItem = item
@@ -490,7 +556,23 @@ class RelayClient(
             blobId?.let { deleteBlob(it) }
         } finally {
             tempFile?.delete()
+            encryptedTempFile?.delete()
         }
+    }
+
+    private fun copyEncryptedBlob(input: InputStream, output: java.io.OutputStream): Long {
+        val buffer = ByteArray(64 * 1024)
+        var total = 0L
+        while (true) {
+            val count = input.read(buffer)
+            if (count < 0) break
+            total += count
+            if (total > MAX_ENCRYPTED_BLOB_BYTES)
+                throw PermanentMessageError("Encrypted blob exceeds the size limit.")
+            output.write(buffer, 0, count)
+        }
+        if (total < 28) throw PermanentMessageError("Encrypted blob is too short.")
+        return total
     }
 
     private suspend fun sendLoop(socket: WebSocket) {
@@ -565,7 +647,7 @@ class RelayClient(
 
     private fun isPermanent(error: Exception): Boolean =
         error is PermanentMessageError || error is GeneralSecurityException ||
-            error is SerializationException
+            error is InvalidCipherTextException || error is SerializationException
 
     private fun remember(id: String) {
         recentIds.add(id)
@@ -622,6 +704,7 @@ class RelayClient(
     companion object {
         private const val INLINE_TEXT_BYTES = 32 * 1024
         private const val MAX_PLAINTEXT_BLOB_BYTES = 95L * 1024 * 1024
+        private const val MAX_ENCRYPTED_BLOB_BYTES = MAX_PLAINTEXT_BLOB_BYTES + 28
         private const val RECENT_ID_LIMIT = 1000
         private const val STANDARD_TIMEOUT = 30_000L
         private const val BLOB_TIMEOUT = 10 * 60_000L

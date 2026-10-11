@@ -1,5 +1,7 @@
 package dev.peytonli.tapdrop.core
 
+import java.io.InputStream
+import java.io.OutputStream
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 import java.security.SecureRandom
@@ -8,14 +10,22 @@ import javax.crypto.Cipher
 import javax.crypto.Mac
 import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.SecretKeySpec
+import org.bouncycastle.crypto.InvalidCipherTextException
+import org.bouncycastle.crypto.engines.AESEngine
+import org.bouncycastle.crypto.modes.GCMBlockCipher
+import org.bouncycastle.crypto.params.AEADParameters
+import org.bouncycastle.crypto.params.KeyParameter
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
+
+data class BlobStreamResult(val plainSize: Long, val plainSha256Hex: String)
 
 object TapDropCrypto {
     private val random = SecureRandom()
     private val base64Encoder = Base64.getUrlEncoder().withoutPadding()
     private val base64Decoder = Base64.getUrlDecoder()
     private val salt = "tapdrop-v1".toByteArray(StandardCharsets.US_ASCII)
+    private const val STREAM_BUFFER_SIZE = 64 * 1024
 
     fun deriveEncryptionKey(masterKey: ByteArray): ByteArray = deriveKey(masterKey, "enc")
 
@@ -56,6 +66,76 @@ object TapDropCrypto {
         return gcm(Cipher.DECRYPT_MODE, pair.masterKeyBytes, body.copyOfRange(0, 12), blobAad(pair, blobId), body.copyOfRange(12, body.size))
     }
 
+    fun encryptBlobStream(
+        pair: PairInfo,
+        blobId: String,
+        input: InputStream,
+        output: OutputStream,
+        nonce: ByteArray = random12(),
+    ): BlobStreamResult {
+        require(nonce.size == 12)
+        val cipher = GCMBlockCipher.newInstance(AESEngine.newInstance())
+        cipher.init(
+            true,
+            AEADParameters(KeyParameter(deriveEncryptionKey(pair.masterKeyBytes)), 128, nonce, blobAad(pair, blobId)),
+        )
+        output.write(nonce)
+        val digest = MessageDigest.getInstance("SHA-256")
+        val inputBuffer = ByteArray(STREAM_BUFFER_SIZE)
+        val outputBuffer = ByteArray(STREAM_BUFFER_SIZE + 32)
+        var plainSize = 0L
+        while (true) {
+            val count = readChunk(input, inputBuffer)
+            if (count < 0) break
+            digest.update(inputBuffer, 0, count)
+            plainSize += count
+            val written = cipher.processBytes(inputBuffer, 0, count, outputBuffer, 0)
+            if (written > 0) output.write(outputBuffer, 0, written)
+        }
+        val finalCount = cipher.doFinal(outputBuffer, 0)
+        if (finalCount > 0) output.write(outputBuffer, 0, finalCount)
+        return BlobStreamResult(plainSize, digest.digest().toHex())
+    }
+
+    fun decryptBlobStream(
+        pair: PairInfo,
+        blobId: String,
+        input: InputStream,
+        output: OutputStream,
+    ): BlobStreamResult {
+        val nonce = ByteArray(12)
+        readFully(input, nonce)
+        val cipher = GCMBlockCipher.newInstance(AESEngine.newInstance())
+        cipher.init(
+            false,
+            AEADParameters(KeyParameter(deriveEncryptionKey(pair.masterKeyBytes)), 128, nonce, blobAad(pair, blobId)),
+        )
+        val digest = MessageDigest.getInstance("SHA-256")
+        val inputBuffer = ByteArray(STREAM_BUFFER_SIZE)
+        val outputBuffer = ByteArray(STREAM_BUFFER_SIZE + 32)
+        var encryptedSize = 0L
+        var plainSize = 0L
+        while (true) {
+            val count = readChunk(input, inputBuffer)
+            if (count < 0) break
+            encryptedSize += count
+            val written = cipher.processBytes(inputBuffer, 0, count, outputBuffer, 0)
+            if (written > 0) {
+                digest.update(outputBuffer, 0, written)
+                plainSize += written
+                output.write(outputBuffer, 0, written)
+            }
+        }
+        if (encryptedSize < 16) throw InvalidCipherTextException("Encrypted blob is too short.")
+        val finalCount = cipher.doFinal(outputBuffer, 0)
+        if (finalCount > 0) {
+            digest.update(outputBuffer, 0, finalCount)
+            plainSize += finalCount
+            output.write(outputBuffer, 0, finalCount)
+        }
+        return BlobStreamResult(plainSize, digest.digest().toHex())
+    }
+
     fun sha256(bytes: ByteArray): ByteArray = MessageDigest.getInstance("SHA-256").digest(bytes)
 
     fun sha256Hex(bytes: ByteArray): String = sha256(bytes).toHex()
@@ -85,6 +165,32 @@ object TapDropCrypto {
         cipher.updateAAD(aad)
         return cipher.doFinal(input)
     }
+
+    private fun readChunk(input: InputStream, buffer: ByteArray): Int {
+        val count = input.read(buffer)
+        if (count != 0) return count
+        val value = input.read()
+        if (value < 0) return -1
+        buffer[0] = value.toByte()
+        return 1
+    }
+
+    private fun readFully(input: InputStream, buffer: ByteArray) {
+        var offset = 0
+        while (offset < buffer.size) {
+            val count = input.read(buffer, offset, buffer.size - offset)
+            if (count < 0) throw InvalidCipherTextException("Encrypted blob is too short.")
+            if (count == 0) {
+                val value = input.read()
+                if (value < 0) throw InvalidCipherTextException("Encrypted blob is too short.")
+                buffer[offset++] = value.toByte()
+            } else {
+                offset += count
+            }
+        }
+    }
+
+    private fun random12(): ByteArray = ByteArray(12).also(random::nextBytes)
 
     private fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }
 }

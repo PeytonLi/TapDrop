@@ -41,6 +41,7 @@ android {
 }
 
 tasks.withType<Test>().configureEach {
+    maxHeapSize = "160m"
     systemProperty("tapdrop.vectors", rootProject.file("../protocol/test-vectors.json").absolutePath)
     val runInterop = providers.gradleProperty("tapdropInteropE2E").map { it == "true" }.orElse(false)
     if (name == "testDebugUnitTest" && !runInterop.get()) {
@@ -49,12 +50,14 @@ tasks.withType<Test>().configureEach {
     if (name == "testDebugUnitTest" && runInterop.get()) {
         systemProperty("tapdrop.interop.qr", providers.gradleProperty("interopQr").getOrElse(""))
         systemProperty("tapdrop.interop.dir", providers.gradleProperty("interopDir").getOrElse(""))
+        systemProperty("tapdrop.interop.phoneFile", providers.gradleProperty("interopPhoneFile").getOrElse(""))
         systemProperty("tapdrop.interop.laptopFile", providers.gradleProperty("interopLaptopFile").getOrElse(""))
     }
 }
 
 dependencies {
     implementation(platform("androidx.compose:compose-bom:2025.01.00"))
+    implementation("org.bouncycastle:bcprov-jdk18on:1.78.1")
     implementation("androidx.core:core-ktx:1.15.0")
     implementation("androidx.activity:activity-compose:1.10.0")
     implementation("androidx.activity:activity-ktx:1.10.0")
