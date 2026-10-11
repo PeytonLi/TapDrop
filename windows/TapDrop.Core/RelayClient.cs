@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Net.WebSockets;
+using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -15,6 +16,7 @@ public sealed class RelayClient : IAsyncDisposable
     private const int InlineTextBytes = 32 * 1024;
     private static readonly TimeSpan StandardRequestTimeout = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan BlobRequestTimeout = TimeSpan.FromMinutes(10);
+    private static readonly TimeSpan BlobUploadRetryWindow = TimeSpan.FromMinutes(15);
     private readonly PairInfo _pair;
     private readonly HttpClient _httpClient;
     private readonly Channel<PendingSend> _outgoing = Channel.CreateUnbounded<PendingSend>();
@@ -22,7 +24,20 @@ public sealed class RelayClient : IAsyncDisposable
     private readonly object _dedupeLock = new();
     private readonly Queue<string> _recentOrder = new();
     private readonly HashSet<string> _recentIds = [];
+    private readonly Dictionary<string, (int Count, long Generation)> _handlerFailures = [];
+    private readonly Queue<(string Id, long Generation)> _handlerFailureOrder = new();
+    private long _handlerFailureGeneration;
     private readonly SemaphoreSlim _socketSendLock = new(1, 1);
+    private readonly object _uploadRetryLock = new();
+    private readonly Channel<byte> _reconnectSignals = Channel.CreateBounded<byte>(new BoundedChannelOptions(1)
+    {
+        FullMode = BoundedChannelFullMode.DropWrite,
+        SingleReader = true,
+        SingleWriter = false,
+    });
+    private TaskCompletionSource<long> _uploadRetrySignal = NewUploadRetrySignal();
+    private long _uploadRetryVersion;
+    private ClientWebSocket? _activeSocket;
     private CancellationTokenSource? _lifetime;
     private Task? _runTask;
     private Func<ReceivedItem, Task>? _handler;
@@ -37,6 +52,13 @@ public sealed class RelayClient : IAsyncDisposable
     public event Action<bool, bool>? ConnectionChanged;
     public event Action<string>? Delivered;
     public Task Completion => _runTask ?? Task.CompletedTask;
+
+    public void ReconnectNow()
+    {
+        _reconnectSignals.Writer.TryWrite(0);
+        SignalUploadRetries();
+        Volatile.Read(ref _activeSocket)?.Abort();
+    }
 
     public async Task RegisterAsync(CancellationToken cancellationToken = default)
     {
@@ -164,9 +186,57 @@ public sealed class RelayClient : IAsyncDisposable
         if (_runTask is null) throw new InvalidOperationException("StartAsync must be called before sending.");
     }
 
-    private async Task<BlobRef> UploadBlobAsync(byte[] plaintext, string name, string mime, CancellationToken cancellationToken)
+    internal async Task<BlobRef> UploadBlobAsync(byte[] plaintext, string name, string mime, CancellationToken cancellationToken)
     {
         if (plaintext.Length > MaxPlaintextBlobBytes) throw new InvalidOperationException("TapDrop blobs are limited to 95 MiB.");
+        var stopwatch = Stopwatch.StartNew();
+        var backoffSeconds = 1.0;
+        Exception? lastError = null;
+        while (true)
+        {
+            var signal = GetUploadRetrySignal();
+            var remaining = BlobUploadRetryWindow - stopwatch.Elapsed;
+            if (remaining <= TimeSpan.Zero) throw lastError ?? new TimeoutException("Blob upload retry window expired.");
+            try
+            {
+                return await UploadBlobOnceAsync(plaintext, name, mime, Min(BlobRequestTimeout, remaining), cancellationToken);
+            }
+            catch (Exception error) when (IsTransientBlobUploadFailure(error) && !cancellationToken.IsCancellationRequested)
+            {
+                lastError = error;
+                remaining = BlobUploadRetryWindow - stopwatch.Elapsed;
+                if (remaining <= TimeSpan.Zero) throw;
+                if (GetUploadRetrySignal().Version != signal.Version)
+                {
+                    backoffSeconds = 1;
+                    continue;
+                }
+
+                var jitter = 0.75 + Random.Shared.NextDouble() * 0.5;
+                var delay = TimeSpan.FromSeconds(backoffSeconds * jitter);
+                var signalled = await WaitForUploadRetryAsync(signal.Task, Min(delay, remaining), cancellationToken);
+                backoffSeconds = signalled ? 1 : Math.Min(30, backoffSeconds * 2);
+            }
+        }
+    }
+
+    internal static bool IsTransientBlobUploadFailure(Exception error)
+    {
+        if (error is HttpRequestException { StatusCode: { } status })
+        {
+            var code = (int)status;
+            return code is 408 or 429 || code >= 500;
+        }
+        return error is HttpRequestException or IOException or TimeoutException or OperationCanceledException;
+    }
+
+    private async Task<BlobRef> UploadBlobOnceAsync(
+        byte[] plaintext,
+        string name,
+        string mime,
+        TimeSpan requestTimeout,
+        CancellationToken cancellationToken)
+    {
         var blobId = TapDropCrypto.ToBase64Url(RandomNumberGenerator.GetBytes(16));
         var body = TapDropCrypto.EncryptBlob(_pair, blobId, plaintext);
         using var request = new HttpRequestMessage(HttpMethod.Put, PairUri($"/blobs/{blobId}"))
@@ -175,11 +245,14 @@ public sealed class RelayClient : IAsyncDisposable
         };
         request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _pair.AuthToken);
         request.Content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
-        using var timeout = CreateRequestTimeout(cancellationToken, BlobRequestTimeout);
+        using var timeout = CreateRequestTimeout(cancellationToken, requestTimeout);
         using var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token);
-        if (response.StatusCode != System.Net.HttpStatusCode.Created)
+        if (response.StatusCode != HttpStatusCode.Created)
         {
-            throw new HttpRequestException($"Blob upload failed with {(int)response.StatusCode} {response.ReasonPhrase}.");
+            throw new HttpRequestException(
+                $"Blob upload failed with {(int)response.StatusCode} {response.ReasonPhrase}.",
+                null,
+                response.StatusCode);
         }
         return new BlobRef
         {
@@ -197,6 +270,7 @@ public sealed class RelayClient : IAsyncDisposable
         while (!cancellationToken.IsCancellationRequested)
         {
             using var socket = new ClientWebSocket();
+            Volatile.Write(ref _activeSocket, socket);
             var connectedAt = DateTime.MinValue;
             socket.Options.SetRequestHeader("Authorization", $"Bearer {_pair.AuthToken}");
             try
@@ -233,6 +307,7 @@ public sealed class RelayClient : IAsyncDisposable
             }
             finally
             {
+                Interlocked.CompareExchange(ref _activeSocket, null, socket);
                 SetConnection(false, false);
             }
 
@@ -243,7 +318,7 @@ public sealed class RelayClient : IAsyncDisposable
             var jitter = 0.75 + Random.Shared.NextDouble() * 0.5;
             try
             {
-                await Task.Delay(TimeSpan.FromMilliseconds(backoff.TotalMilliseconds * jitter), cancellationToken);
+                await WaitForReconnectAsync(TimeSpan.FromMilliseconds(backoff.TotalMilliseconds * jitter), cancellationToken);
             }
             catch (OperationCanceledException) { break; }
         }
@@ -330,6 +405,7 @@ public sealed class RelayClient : IAsyncDisposable
         {
             if (_recentIds.Contains(id))
             {
+                _handlerFailures.Remove(id);
                 _ = SendAckAsync(socket, id, cancellationToken);
                 return;
             }
@@ -346,6 +422,19 @@ public sealed class RelayClient : IAsyncDisposable
             var item = TapDropCrypto.DecryptItem(_pair, from, id, envelope);
             if (item.Kind is not ("text" or "url" or "image" or "file"))
                 throw new InvalidDataException($"Unknown item kind: {item.Kind}.");
+            if (IsHandlerPoisoned(id))
+            {
+                blobIdToDelete = item.Blob?.Id;
+                await SendAckAsync(socket, id, cancellationToken);
+                ClearHandlerFailures(id);
+                WriteLog($"Dropped TapDrop message {id} after 3 handler failures.");
+                if (blobIdToDelete is not null)
+                {
+                    try { await DeleteBlobAsync(blobIdToDelete, cancellationToken); }
+                    catch (Exception cleanupError) { WriteLog($"TapDrop blob cleanup failed: {cleanupError.Message}"); }
+                }
+                return;
+            }
             if (item.Blob is not null)
             {
                 blobIdToDelete = item.Blob.Id;
@@ -374,7 +463,32 @@ public sealed class RelayClient : IAsyncDisposable
                 if (item.Kind == "text") item.Text = Encoding.UTF8.GetString(plaintext);
             }
 
-            await (_handler?.Invoke(new ReceivedItem(id, from, item, blobPath)) ?? Task.CompletedTask);
+            try
+            {
+                await (_handler?.Invoke(new ReceivedItem(id, from, item, blobPath)) ?? Task.CompletedTask);
+                ClearHandlerFailures(id);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception handlerError)
+            {
+                if (RecordHandlerFailure(id) >= 3)
+                {
+                    await SendAckAsync(socket, id, cancellationToken);
+                    ClearHandlerFailures(id);
+                    WriteLog($"Dropped TapDrop message {id} after 3 handler failures: {handlerError.Message}");
+                    if (blobIdToDelete is not null)
+                    {
+                        try { await DeleteBlobAsync(blobIdToDelete, cancellationToken); }
+                        catch (Exception cleanupError) { WriteLog($"TapDrop blob cleanup failed: {cleanupError.Message}"); }
+                    }
+                    if (blobPath is not null && File.Exists(blobPath)) File.Delete(blobPath);
+                    return;
+                }
+                throw;
+            }
             await SendAckAsync(socket, id, cancellationToken);
             if (blobIdToDelete is not null) await DeleteBlobAsync(blobIdToDelete, cancellationToken);
             if (blobPath is not null && File.Exists(blobPath)) File.Delete(blobPath);
@@ -486,8 +600,53 @@ public sealed class RelayClient : IAsyncDisposable
 
     private void SetConnection(bool connected, bool peerOnline)
     {
+        if (connected) SignalUploadRetries();
         try { ConnectionChanged?.Invoke(connected, peerOnline); } catch (Exception error) { WriteLog(error.ToString()); }
     }
+
+    private (long Version, Task<long> Task) GetUploadRetrySignal()
+    {
+        lock (_uploadRetryLock) return (_uploadRetryVersion, _uploadRetrySignal.Task);
+    }
+
+    private void SignalUploadRetries()
+    {
+        TaskCompletionSource<long> signal;
+        long version;
+        lock (_uploadRetryLock)
+        {
+            version = ++_uploadRetryVersion;
+            signal = _uploadRetrySignal;
+            _uploadRetrySignal = NewUploadRetrySignal();
+        }
+        signal.TrySetResult(version);
+    }
+
+    private static TaskCompletionSource<long> NewUploadRetrySignal() =>
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    private async Task<bool> WaitForUploadRetryAsync(Task<long> signal, TimeSpan delay, CancellationToken cancellationToken)
+    {
+        using var waiting = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var delayTask = Task.Delay(delay, waiting.Token);
+        var signalTask = signal.WaitAsync(waiting.Token);
+        var completed = await Task.WhenAny(delayTask, signalTask);
+        await completed;
+        waiting.Cancel();
+        return completed == signalTask;
+    }
+
+    private async Task WaitForReconnectAsync(TimeSpan delay, CancellationToken cancellationToken)
+    {
+        using var waiting = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var delayTask = Task.Delay(delay, waiting.Token);
+        var signalTask = _reconnectSignals.Reader.ReadAsync(waiting.Token).AsTask();
+        var completed = await Task.WhenAny(delayTask, signalTask);
+        await completed;
+        waiting.Cancel();
+    }
+
+    private static TimeSpan Min(TimeSpan first, TimeSpan second) => first <= second ? first : second;
 
     private void WriteLog(string message)
     {
@@ -515,7 +674,12 @@ public sealed class RelayClient : IAsyncDisposable
     {
         _recentIds.Add(id);
         _recentOrder.Enqueue(id);
-        while (_recentOrder.Count > 1000) _recentIds.Remove(_recentOrder.Dequeue());
+        while (_recentOrder.Count > 1000)
+        {
+            var expired = _recentOrder.Dequeue();
+            _recentIds.Remove(expired);
+            _handlerFailures.Remove(expired);
+        }
     }
 
     private void ForgetId(string id)
@@ -524,6 +688,45 @@ public sealed class RelayClient : IAsyncDisposable
         var retained = _recentOrder.Where(value => value != id).ToArray();
         _recentOrder.Clear();
         foreach (var value in retained) _recentOrder.Enqueue(value);
+    }
+
+    private int RecordHandlerFailure(string id)
+    {
+        lock (_dedupeLock)
+        {
+            int count;
+            long generation;
+            if (_handlerFailures.TryGetValue(id, out var failure))
+            {
+                count = failure.Count + 1;
+                generation = failure.Generation;
+            }
+            else
+            {
+                count = 1;
+                generation = ++_handlerFailureGeneration;
+                _handlerFailureOrder.Enqueue((id, generation));
+            }
+            _handlerFailures[id] = (count, generation);
+            while (_handlerFailureOrder.Count > 1000)
+            {
+                var oldest = _handlerFailureOrder.Dequeue();
+                if (_handlerFailures.TryGetValue(oldest.Id, out var current)
+                    && current.Generation == oldest.Generation)
+                    _handlerFailures.Remove(oldest.Id);
+            }
+            return count;
+        }
+    }
+
+    private bool IsHandlerPoisoned(string id)
+    {
+        lock (_dedupeLock) return _handlerFailures.TryGetValue(id, out var failure) && failure.Count >= 3;
+    }
+
+    private void ClearHandlerFailures(string id)
+    {
+        lock (_dedupeLock) _handlerFailures.Remove(id);
     }
 
     private static string? GetString(JsonElement frame, string name) =>

@@ -23,7 +23,6 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.selects.select
@@ -61,9 +60,10 @@ data class SendReceipt(val id: String, val connectedWhenQueued: Boolean)
 class RelayClient(
     private val pair: PairInfo,
     private val cacheDirectory: File,
+    httpClient: OkHttpClient? = null,
     private val log: (String) -> Unit = { System.err.println(it) },
 ) : AutoCloseable {
-    private val http = OkHttpClient.Builder()
+    private val http = httpClient ?: OkHttpClient.Builder()
         .readTimeout(0, TimeUnit.MILLISECONDS)
         .writeTimeout(0, TimeUnit.MILLISECONDS)
         .callTimeout(0, TimeUnit.MILLISECONDS)
@@ -73,6 +73,8 @@ class RelayClient(
     private val dedupeLock = Any()
     private val recentOrder = ArrayDeque<String>()
     private val recentIds = HashSet<String>()
+    private val handlerFailures = LinkedHashMap<String, Int>(16, 0.75f, true)
+    private val uploadRetrySignal = AtomicReference(UploadRetrySignal(0, CompletableDeferred()))
     private val socket = AtomicReference<WebSocket?>()
     private val reconnectRequests = Channel<Unit>(Channel.CONFLATED)
     private val lastPongNanos = AtomicLong()
@@ -108,6 +110,7 @@ class RelayClient(
 
     fun reconnectNow() {
         reconnectRequests.trySend(Unit)
+        signalUploadRetries()
         socket.get()?.cancel()
     }
 
@@ -117,7 +120,6 @@ class RelayClient(
         val item = if (bytes.size <= INLINE_TEXT_BYTES) {
             newItem(kind = "text", source = source, text = text)
         } else {
-            awaitConnected()
             newItem(kind = "text", source = source).copy(
                 blob = uploadBlob(bytes, "text.txt", "text/plain"),
             )
@@ -134,7 +136,6 @@ class RelayClient(
         checkStarted()
         require(file.isFile) { "File to send was not found." }
         require(file.length() <= MAX_PLAINTEXT_BLOB_BYTES) { "TapDrop files are limited to 95 MiB." }
-        awaitConnected()
         val bytes = withContext(Dispatchers.IO) { file.readBytes() }
         val contentType = mime ?: mimeFor(file.extension)
         val blob = uploadBlob(bytes, file.name, contentType)
@@ -194,8 +195,53 @@ class RelayClient(
         }
     }
 
-    private suspend fun uploadBlob(plaintext: ByteArray, name: String, mime: String): BlobRef {
+    internal suspend fun uploadBlob(plaintext: ByteArray, name: String, mime: String): BlobRef {
         require(plaintext.size <= MAX_PLAINTEXT_BLOB_BYTES) { "TapDrop blobs are limited to 95 MiB." }
+        val startedAt = System.nanoTime()
+        var backoffMillis = 1000L
+        var lastError: Exception? = null
+        while (true) {
+            val signal = uploadRetrySignal.get()
+            var remainingNanos = TimeUnit.MINUTES.toNanos(15) - (System.nanoTime() - startedAt)
+            if (remainingNanos <= 0) throw lastError ?: IOException("Blob upload retry window expired.")
+            try {
+                val timeoutMillis = minOf(BLOB_TIMEOUT, TimeUnit.NANOSECONDS.toMillis(remainingNanos).coerceAtLeast(1))
+                return uploadBlobAttempt(plaintext, name, mime, timeoutMillis)
+            } catch (error: kotlinx.coroutines.CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                if (!isRetryableBlobUploadError(error)) throw error
+                lastError = error
+                remainingNanos = TimeUnit.MINUTES.toNanos(15) - (System.nanoTime() - startedAt)
+                if (remainingNanos <= 0) throw error
+                if (uploadRetrySignal.get().version != signal.version) {
+                    backoffMillis = 1000L
+                    continue
+                }
+                val jitter = 0.75 + Math.random() * 0.5
+                val delayMillis = (backoffMillis * jitter).toLong().coerceAtLeast(1)
+                val waitMillis = minOf(delayMillis, TimeUnit.NANOSECONDS.toMillis(remainingNanos).coerceAtLeast(1))
+                val woke = kotlinx.coroutines.withTimeoutOrNull(waitMillis) {
+                    signal.ready.await()
+                    true
+                } ?: false
+                backoffMillis = if (woke) 1000L else (backoffMillis * 2).coerceAtMost(30_000L)
+            }
+        }
+    }
+
+    internal fun isRetryableBlobUploadError(error: Exception): Boolean = when (error) {
+        is RelayHttpException -> error.status == 408 || error.status == 429 || error.status in 500..599
+        is IOException -> true
+        else -> false
+    }
+
+    private suspend fun uploadBlobAttempt(
+        plaintext: ByteArray,
+        name: String,
+        mime: String,
+        timeoutMillis: Long,
+    ): BlobRef {
         val id = TapDropCrypto.toBase64Url(ByteArray(16).also(java.security.SecureRandom()::nextBytes))
         val encrypted = TapDropCrypto.encryptBlob(pair, id, plaintext)
         val request = Request.Builder()
@@ -203,11 +249,22 @@ class RelayClient(
             .header("Authorization", "Bearer ${pair.authToken}")
             .put(encrypted.toRequestBody("application/octet-stream".toMediaType()))
             .build()
-        execute(request, BLOB_TIMEOUT).use { response ->
+        execute(request, timeoutMillis).use { response ->
             if (response.code != HttpURLConnection.HTTP_CREATED)
                 throw RelayHttpException(response.code, "Blob upload failed")
         }
         return BlobRef(id, name, mime, plaintext.size.toLong(), TapDropCrypto.sha256Hex(plaintext))
+    }
+
+    private fun signalUploadRetries() {
+        while (true) {
+            val current = uploadRetrySignal.get()
+            val replacement = UploadRetrySignal(current.version + 1, CompletableDeferred())
+            if (uploadRetrySignal.compareAndSet(current, replacement)) {
+                current.ready.complete(Unit)
+                return
+            }
+        }
     }
 
     private suspend fun reconnectLoop(role: String) {
@@ -243,6 +300,7 @@ class RelayClient(
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 opened.complete(webSocket)
                 _connectionState.value = RelayConnectionState(connected = true)
+                signalUploadRetries()
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
@@ -318,6 +376,7 @@ class RelayClient(
         if (from != "phone" && from != "laptop") return
         synchronized(dedupeLock) {
             if (id in recentIds) {
+                handlerFailures.remove(id)
                 sendFrame(socket, ackFrame(id))
                 return
             }
@@ -339,6 +398,17 @@ class RelayClient(
                 }
                 if (item.kind !in setOf("text", "url", "image", "file"))
                     throw PermanentMessageError("Unknown item kind: ${item.kind}.")
+                if (isHandlerPoisoned(id)) {
+                    blobId = item.blob?.id
+                    sendFrame(socket, ackFrame(id))
+                    clearHandlerFailures(id)
+                    log("Dropped TapDrop message $id after 3 handler failures.")
+                    blobId?.let { poisonedBlobId ->
+                        try { deleteBlob(poisonedBlobId) }
+                        catch (cleanup: Exception) { log("TapDrop blob cleanup failed: ${cleanup.message}") }
+                    }
+                    return
+                }
                 val blob = item.blob
                 if (blob != null) {
                     blobId = blob.id
@@ -383,7 +453,21 @@ class RelayClient(
             }
             try {
                 handler?.invoke(ReceivedItem(id, from, decodedItem ?: throw IllegalStateException("Message was not decoded."), tempFile))
+                clearHandlerFailures(id)
+            } catch (error: kotlinx.coroutines.CancellationException) {
+                synchronized(dedupeLock) { forget(id) }
+                throw error
             } catch (error: Exception) {
+                if (recordHandlerFailure(id) >= 3) {
+                    sendFrame(socket, ackFrame(id))
+                    clearHandlerFailures(id)
+                    log("Dropped TapDrop message $id after 3 handler failures: ${error.message}")
+                    blobId?.let { poisonedBlobId ->
+                        try { deleteBlob(poisonedBlobId) }
+                        catch (cleanup: Exception) { log("TapDrop blob cleanup failed: ${cleanup.message}") }
+                    }
+                    return
+                }
                 synchronized(dedupeLock) { forget(id) }
                 throw error
             }
@@ -468,19 +552,35 @@ class RelayClient(
         error is PermanentMessageError || error is GeneralSecurityException ||
             error is SerializationException
 
-    private suspend fun awaitConnected() {
-        connectionState.first { it.connected }
-    }
-
     private fun remember(id: String) {
         recentIds.add(id)
         recentOrder.addLast(id)
-        while (recentOrder.size > RECENT_ID_LIMIT) recentIds.remove(recentOrder.removeFirst())
+        while (recentOrder.size > RECENT_ID_LIMIT) {
+            val expired = recentOrder.removeFirst()
+            recentIds.remove(expired)
+            handlerFailures.remove(expired)
+        }
     }
 
     private fun forget(id: String) {
         if (!recentIds.remove(id)) return
         recentOrder.remove(id)
+    }
+
+    private fun recordHandlerFailure(id: String): Int = synchronized(dedupeLock) {
+        val count = (handlerFailures[id] ?: 0) + 1
+        handlerFailures[id] = count
+        while (handlerFailures.size > RECENT_ID_LIMIT)
+            handlerFailures.remove(handlerFailures.keys.first())
+        count
+    }
+
+    private fun isHandlerPoisoned(id: String): Boolean = synchronized(dedupeLock) {
+        (handlerFailures[id] ?: 0) >= 3
+    }
+
+    private fun clearHandlerFailures(id: String) {
+        synchronized(dedupeLock) { handlerFailures.remove(id) }
     }
 
     private fun settingSeconds(name: String, default: Long): Long =
@@ -496,6 +596,8 @@ class RelayClient(
         "zip" -> "application/zip"
         else -> "application/octet-stream"
     }
+
+    private data class UploadRetrySignal(val version: Long, val ready: CompletableDeferred<Unit>)
 
     private class PendingSend(val id: String, val frame: String) {
         val stored = CompletableDeferred<String>()
