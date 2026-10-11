@@ -6,8 +6,10 @@
     <EnableWindowsTargeting>true</EnableWindowsTargeting>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <ApplicationIcon>TapDrop.ico</ApplicationIcon>
   </PropertyGroup>
   <ItemGroup>
+    <EmbeddedResource Include="TapDrop.ico" LogicalName="TapDrop.ico" />
     <ProjectReference Include="../TapDrop.Core/TapDrop.Core.csproj" />
     <PackageReference Include="Microsoft.Toolkit.Uwp.Notifications" Version="7.1.3" />
     <PackageReference Include="NAudio.WinMM" Version="2.2.1" />

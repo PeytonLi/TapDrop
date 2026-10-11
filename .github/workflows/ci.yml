@@ -73,8 +73,22 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: 8.0.x
-      - run: dotnet publish windows/TapDrop.Tray -c Release -r win-x64 --self-contained -p:PublishSingleFile=true
+      - name: Ensure Inno Setup
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) { choco install innosetup -y --no-progress }
+      - name: Build installer
+        id: installer
+        shell: pwsh
+        run: ./windows/installer/build.ps1
+      - name: Smoke-test installer
+        shell: pwsh
+        run: ./windows/installer/smoke-test.ps1 -Installer "${{ steps.installer.outputs.installer }}"
       - uses: actions/upload-artifact@v4
         with:
           name: TapDrop-Windows
           path: windows/TapDrop.Tray/bin/Release/net8.0-windows10.0.19041.0/win-x64/publish/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TapDrop-Setup-${{ steps.installer.outputs.version }}
+          path: ${{ steps.installer.outputs.installer }}

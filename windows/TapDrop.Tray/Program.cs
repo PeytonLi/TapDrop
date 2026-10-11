@@ -6,6 +6,8 @@ internal static class Program
     private static void Main(string[] args)
     {
         using var mutex = new Mutex(true, @"Local\TapDrop.Tray", out var isNewInstance);
+        if (isNewInstance && args.Contains("--quit", StringComparer.OrdinalIgnoreCase)) return;
+
         if (!isNewInstance)
         {
             try
