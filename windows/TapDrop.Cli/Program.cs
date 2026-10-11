@@ -31,7 +31,9 @@ internal static class Cli
     private static async Task<int> PairNewAsync(string[] args)
     {
         var options = Parse(args);
-        var pair = PairInfo.Generate(Require(options, "relay"), Require(options, "name"));
+        var relayUrl = options.GetValueOrDefault("relay");
+        if (string.IsNullOrWhiteSpace(relayUrl)) relayUrl = RelayDefaults.Url;
+        var pair = PairInfo.Generate(relayUrl, Require(options, "name"));
         await using var client = new RelayClient(pair);
         await client.RegisterAsync();
         await SavePairAsync(Require(options, "out"), pair);
@@ -191,7 +193,7 @@ internal static class Cli
     private static int Usage()
     {
         Console.Error.WriteLine(
-            "TapDrop CLI: pair-new --relay URL --name N --out F | join --qr PAYLOAD --name N --out F | " +
+            "TapDrop CLI: pair-new [--relay URL] --name N --out F | join --qr PAYLOAD --name N --out F | " +
             "listen --config F --role laptop|phone --save-dir D | send-text --config F --role R --text TEXT | " +
             "send-url --config F --role R --url URL | send-file --config F --role R --path FILE [--mime MIME] [--kind file|image]");
         return 2;

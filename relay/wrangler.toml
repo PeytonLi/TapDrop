@@ -1,6 +1,7 @@
 name = "tapdrop-relay"
 main = "src/index.ts"
 compatibility_date = "2025-09-06"
+workers_dev = true
 
 [vars]
 MAX_BLOB_BYTES = "104857600"

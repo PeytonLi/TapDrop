@@ -30,6 +30,14 @@ npm run dev
 npm run deploy # after `npx wrangler login`
 ```
 
+### Deployed relay
+
+The deployed relay is `https://tapdrop-relay.lipeyton2006.workers.dev`. To deploy an update with Wrangler:
+
+```sh
+cd relay && npx wrangler deploy
+```
+
 Build and use the development CLI:
 
 ```sh
@@ -38,6 +46,10 @@ dotnet run --project windows/TapDrop.Cli -- pair-new --relay http://127.0.0.1:87
 dotnet run --project windows/TapDrop.Cli -- listen --config laptop.json --role laptop --save-dir received
 dotnet run --project windows/TapDrop.Cli -- send-text --config laptop.json --role laptop --text "Hello"
 ```
+
+#### Knock to send (laptop → phone)
+
+Enable **Knock to send** in the tray app's **Settings** (off by default), then double-knock the laptop palm rest or lid to send the clipboard to the phone. Use **Test knock** and the sensitivity slider to calibrate. The microphone is open only while knock-to-send is enabled and the workstation is unlocked; it is released when disabled or locked. Audio is processed in memory only and is never stored or sent anywhere.
 
 ### Cutting a release
 

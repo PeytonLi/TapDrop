@@ -25,14 +25,19 @@ internal sealed class TrayApplicationContext : ApplicationContext
     private readonly ToolStripMenuItem _recentMenu;
     private readonly ToolStripMenuItem _autoOpenMenu;
     private readonly ToolStripMenuItem _startupMenu;
+    private readonly ToolStripMenuItem _knockMenu;
     private readonly List<RecentEntry> _recent = [];
     private readonly List<string> _pendingSendPaths = [];
     private readonly CancellationTokenSource _pipeCancellation = new();
     private RelayClient? _client;
     private PairDialog? _pairDialog;
+    private KnockListener? _knockListener;
     private bool _connected;
     private bool _peerOnline;
     private bool _isExiting;
+    private bool _sessionLocked;
+    private bool _settingsOpen;
+    private bool _knockUnavailable;
 
     public TrayApplicationContext(string[] args)
     {
@@ -67,6 +72,18 @@ internal sealed class TrayApplicationContext : ApplicationContext
             ConfigStore.Save(_config);
         };
         menu.Items.Add(_startupMenu);
+        _knockMenu = new ToolStripMenuItem("Knock to send")
+        {
+            CheckOnClick = true,
+            Checked = _config.KnockToSend,
+        };
+        _knockMenu.CheckedChanged += (_, _) =>
+        {
+            _config.KnockToSend = _knockMenu.Checked;
+            ConfigStore.Save(_config);
+            ApplyKnockState();
+        };
+        menu.Items.Add(_knockMenu);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Open TapDrop folder", null, (_, _) => OpenPath(ConfigStore.DirectoryPath));
         menu.Items.Add("Unpair", null, async (_, _) => await RunSafelyAsync(UnpairAsync));
@@ -84,6 +101,8 @@ internal sealed class TrayApplicationContext : ApplicationContext
         ToastNotificationManagerCompat.OnActivated += ToastActivated;
         SetStartWithWindows(_config.StartWithWindows);
         CreateSendToShortcut();
+        SystemEvents.SessionSwitch += OnSessionSwitch;
+        ApplyKnockState();
         _ = StartPipeServerAsync(_pipeCancellation.Token);
 
         if (args.Length > 0) HandleForwardedArguments(args);
@@ -104,6 +123,9 @@ internal sealed class TrayApplicationContext : ApplicationContext
     protected override void ExitThreadCore()
     {
         _isExiting = true;
+        SystemEvents.SessionSwitch -= OnSessionSwitch;
+        _knockListener?.Dispose();
+        _knockListener = null;
         _pipeCancellation.Cancel();
         _icon.Visible = false;
         _icon.Dispose();
@@ -141,12 +163,23 @@ internal sealed class TrayApplicationContext : ApplicationContext
     {
         var oldRelay = _config.RelayUrl;
         var oldName = _config.DeviceName;
-        using var dialog = new SettingsDialog(_config);
-        if (dialog.ShowDialog(_host) != DialogResult.OK) return;
-        ConfigStore.Save(_config);
-        if (_config.IsPaired && (oldRelay != _config.RelayUrl || oldName != _config.DeviceName))
-            await RestartClientAsync();
-        UpdateIcon();
+        _settingsOpen = true;
+        ApplyKnockState();
+        try
+        {
+            using var dialog = new SettingsDialog(_config);
+            if (dialog.ShowDialog(_host) != DialogResult.OK) return;
+            ConfigStore.Save(_config);
+            _knockMenu.Checked = _config.KnockToSend;
+            if (_config.IsPaired && (oldRelay != _config.RelayUrl || oldName != _config.DeviceName))
+                await RestartClientAsync();
+            UpdateIcon();
+        }
+        finally
+        {
+            _settingsOpen = false;
+            ApplyKnockState();
+        }
     }
 
     private async Task PairPhoneAsync()
@@ -196,7 +229,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
                 _pairDialog.BeginInvoke(new Action(() => _pairDialog.Close()));
             }
         });
-        _client.Delivered += id => RunOnUi(() => _icon.Text = ClipTooltip($"TapDrop — delivered {id[..Math.Min(8, id.Length)]}"));
+        _client.Delivered += id => RunOnUi(() => SetIconText($"TapDrop — delivered {id[..Math.Min(8, id.Length)]}"));
         await _client.StartAsync("laptop", HandleReceivedAsync);
         UpdateIcon();
         if (_pendingSendPaths.Count > 0)
@@ -211,6 +244,12 @@ internal sealed class TrayApplicationContext : ApplicationContext
     {
         await InvokeAsync(() =>
         {
+            var sender = received.Item.Sender;
+            if (!string.IsNullOrWhiteSpace(sender) && sender != _config.PhoneName)
+            {
+                _config.PhoneName = sender;
+                ConfigStore.Save(_config);
+            }
             switch (received.Item.Kind)
             {
                 case "text":
@@ -250,7 +289,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
         });
     }
 
-    private async Task SendClipboardAsync()
+    private async Task SendClipboardAsync(string source = "hotkey")
     {
         if (_client is null) return;
         try
@@ -258,7 +297,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
             if (Clipboard.ContainsFileDropList())
             {
                 foreach (var path in Clipboard.GetFileDropList())
-                    if (!string.IsNullOrWhiteSpace(path)) await _client.SendFileAsync(path, "laptop", source: "hotkey");
+                    if (!string.IsNullOrWhiteSpace(path)) await _client.SendFileAsync(path, "laptop", source: source);
             }
             else if (Clipboard.ContainsImage())
             {
@@ -267,7 +306,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
                 try
                 {
                     image.Save(path, System.Drawing.Imaging.ImageFormat.Png);
-                    await _client.SendFileAsync(path, "laptop", "image/png", "image", "hotkey");
+                    await _client.SendFileAsync(path, "laptop", "image/png", "image", source);
                 }
                 finally
                 {
@@ -279,9 +318,9 @@ internal sealed class TrayApplicationContext : ApplicationContext
             {
                 var text = Clipboard.GetText();
                 if (Regex.IsMatch(text, @"^https?://\S+$", RegexOptions.IgnoreCase))
-                    await _client.SendUrlAsync(text, "laptop", "hotkey");
+                    await _client.SendUrlAsync(text, "laptop", source);
                 else
-                    await _client.SendTextAsync(text, "laptop", "hotkey");
+                    await _client.SendTextAsync(text, "laptop", source);
             }
         }
         catch (Exception error)
@@ -439,24 +478,106 @@ internal sealed class TrayApplicationContext : ApplicationContext
             if (_peerOnline)
             {
                 _icon.Icon = _trayIcons.PeerOnline;
-                _icon.Text = "TapDrop — peer online";
+                SetIconText("TapDrop — peer online");
             }
             else if (_connected)
             {
                 _icon.Icon = _trayIcons.Connected;
-                _icon.Text = "TapDrop — connected";
+                SetIconText("TapDrop — connected");
             }
             else
             {
                 _icon.Icon = _trayIcons.Connecting;
-                _icon.Text = "TapDrop — connecting";
+                SetIconText("TapDrop — connecting");
             }
         }
         else
         {
             _icon.Icon = _trayIcons.Unpaired;
-            _icon.Text = "TapDrop — unpaired";
+            SetIconText("TapDrop — unpaired");
         }
+    }
+
+    private void ApplyKnockState()
+    {
+        if (_isExiting) return;
+        var shouldListen = _config.KnockToSend && !_sessionLocked && !_settingsOpen;
+        if (shouldListen && _knockListener is null)
+        {
+            var listener = new KnockListener(KnockConfig.FromSensitivity(_config.KnockSensitivity));
+            listener.Triggered += knockEvent => RunOnUi(() => _ = RunSafelyAsync(HandleKnockTriggerAsync));
+            if (listener.Start(out var error))
+            {
+                _knockListener = listener;
+                _knockUnavailable = false;
+            }
+            else
+            {
+                listener.Dispose();
+                _knockUnavailable = true;
+                ShowToast("TapDrop", $"Knock to send (microphone unavailable): {error}");
+            }
+        }
+        else if (!shouldListen && _knockListener is not null)
+        {
+            _knockListener.Dispose();
+            _knockListener = null;
+        }
+
+        if (!shouldListen) _knockUnavailable = false;
+        _knockMenu.Text = _knockListener is not null
+            ? "Knock to send (microphone in use)"
+            : _knockUnavailable ? "Knock to send (microphone unavailable)" : "Knock to send";
+        UpdateIcon();
+    }
+
+    private async Task HandleKnockTriggerAsync()
+    {
+        if (_client is null)
+        {
+            ShowToast("TapDrop", "Knock: pair a phone first");
+            return;
+        }
+        if (!ClipboardHasSendableContent())
+        {
+            ShowToast("TapDrop", "Knock: clipboard is empty");
+            return;
+        }
+
+        var phoneName = string.IsNullOrWhiteSpace(_config.PhoneName) ? "phone" : _config.PhoneName;
+        ShowToast("TapDrop", $"Knock: sending clipboard to {phoneName}");
+        await SendClipboardAsync("tap");
+    }
+
+    private static bool ClipboardHasSendableContent()
+    {
+        if (Clipboard.ContainsFileDropList() && Clipboard.GetFileDropList().Count > 0) return true;
+        if (Clipboard.ContainsImage()) return true;
+        return Clipboard.ContainsText() && Clipboard.GetText().Length > 0;
+    }
+
+    private void OnSessionSwitch(object? sender, SessionSwitchEventArgs eventArgs)
+    {
+        RunOnUi(() =>
+        {
+            if (eventArgs.Reason is SessionSwitchReason.SessionLock
+                or SessionSwitchReason.ConsoleDisconnect
+                or SessionSwitchReason.RemoteDisconnect)
+                _sessionLocked = true;
+            else if (eventArgs.Reason is SessionSwitchReason.SessionUnlock
+                or SessionSwitchReason.ConsoleConnect
+                or SessionSwitchReason.RemoteConnect)
+                _sessionLocked = false;
+            else
+                return;
+            ApplyKnockState();
+        });
+    }
+
+    private void SetIconText(string text)
+    {
+        if (_knockListener is not null) text += " · mic on";
+        _icon.Text = ClipTooltip(text);
     }
 
     private void SetStartWithWindows(bool enabled)
