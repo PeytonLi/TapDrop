@@ -5,6 +5,11 @@ using System.Text.RegularExpressions;
 
 namespace TapDrop.Core;
 
+public static class RelayDefaults
+{
+    public const string Url = "https://tapdrop-relay.lipeyton2006.workers.dev";
+}
+
 public sealed class PairInfo(string relayUrl, string pairId, string masterKey, string deviceName)
 {
     public string RelayUrl { get; set; } = relayUrl.TrimEnd('/');

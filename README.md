@@ -24,6 +24,14 @@ npm run dev
 npm run deploy # after `npx wrangler login`
 ```
 
+### Deployed relay
+
+The deployed relay is `https://tapdrop-relay.lipeyton2006.workers.dev`. To deploy an update with Wrangler:
+
+```sh
+cd relay && npx wrangler deploy
+```
+
 Build and use the development CLI:
 
 ```sh
