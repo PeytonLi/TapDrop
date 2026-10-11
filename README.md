@@ -33,6 +33,18 @@ dotnet run --project windows/TapDrop.Cli -- listen --config laptop.json --role l
 dotnet run --project windows/TapDrop.Cli -- send-text --config laptop.json --role laptop --text "Hello"
 ```
 
+### Android
+
+Build the sideloadable debug APK with JDK 17 and Android SDK platform 35:
+
+```bash
+cd android
+./gradlew :app:testDebugUnitTest :app:assembleDebug lint
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+```
+
+On Samsung Galaxy phones, set **Settings → Apps → TapDrop → Battery → Unrestricted** so the paired relay connection can remain available in the background. Allow notifications and add TapDrop's **Send to laptop** tile in Quick Settings for clipboard sharing.
+
 Run the local relay-to-CLI end-to-end test (including a 10 MiB file and offline queue):
 
 ```sh
