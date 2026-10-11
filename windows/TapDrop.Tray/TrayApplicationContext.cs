@@ -19,6 +19,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
     private const uint ModControl = 0x0002;
     private const int VkP = 0x50;
     private readonly HotkeyForm _host;
+    private readonly TrayIcons _trayIcons;
     private readonly NotifyIcon _icon;
     private readonly TrayConfig _config;
     private readonly ToolStripMenuItem _recentMenu;
@@ -35,6 +36,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
 
     public TrayApplicationContext(string[] args)
     {
+        _trayIcons = new TrayIcons();
         _config = ConfigStore.Load();
         _host = new HotkeyForm();
         _host.HotkeyPressed += (_, _) => _ = SendClipboardAsync();
@@ -72,7 +74,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
 
         _icon = new NotifyIcon
         {
-            Icon = SystemIcons.Application,
+            Icon = _trayIcons.Connected,
             Text = "TapDrop — unpaired",
             ContextMenuStrip = menu,
             Visible = true,
@@ -105,6 +107,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
         _pipeCancellation.Cancel();
         _icon.Visible = false;
         _icon.Dispose();
+        _trayIcons.Dispose();
         UnregisterHotKey(_host.Handle, HotkeyId);
         _host.Close();
         _host.Dispose();
@@ -435,23 +438,23 @@ internal sealed class TrayApplicationContext : ApplicationContext
         {
             if (_peerOnline)
             {
-                _icon.Icon = SystemIcons.Information;
+                _icon.Icon = _trayIcons.PeerOnline;
                 _icon.Text = "TapDrop — peer online";
             }
             else if (_connected)
             {
-                _icon.Icon = SystemIcons.Application;
+                _icon.Icon = _trayIcons.Connected;
                 _icon.Text = "TapDrop — connected";
             }
             else
             {
-                _icon.Icon = SystemIcons.Warning;
+                _icon.Icon = _trayIcons.Connecting;
                 _icon.Text = "TapDrop — connecting";
             }
         }
         else
         {
-            _icon.Icon = SystemIcons.Error;
+            _icon.Icon = _trayIcons.Unpaired;
             _icon.Text = "TapDrop — unpaired";
         }
     }
@@ -511,6 +514,12 @@ internal sealed class TrayApplicationContext : ApplicationContext
 
     private void HandleForwardedArguments(string[] args)
     {
+        if (args.Contains("--quit", StringComparer.OrdinalIgnoreCase))
+        {
+            ExitThread();
+            return;
+        }
+
         var paths = args.Where(argument => argument != "--send" && File.Exists(argument)).ToArray();
         if (paths.Length == 0 && args.Length > 1 && args[0] == "--send")
             paths = args.Skip(1).Where(File.Exists).ToArray();
