@@ -91,7 +91,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
 
         _icon = new NotifyIcon
         {
-            Icon = _trayIcons.Connected,
+            Icon = _trayIcons.Unpaired,
             Text = "TapDrop — unpaired",
             ContextMenuStrip = menu,
             Visible = true,
