@@ -30,10 +30,14 @@ Build and use the development CLI:
 dotnet build windows/TapDrop.sln
 dotnet run --project windows/TapDrop.Cli -- pair-new --relay http://127.0.0.1:8787 --name Laptop --out laptop.json
 dotnet run --project windows/TapDrop.Cli -- listen --config laptop.json --role laptop --save-dir received
-dotnet run --project windows/TapDrop.Cli -- send-text --config laptop.json --role laptop --text "Hello"
-```
+  dotnet run --project windows/TapDrop.Cli -- send-text --config laptop.json --role laptop --text "Hello"
+  ```
 
-### Android
+  #### Knock to send (laptop → phone)
+
+  Enable **Knock to send** in Windows Settings (off by default), then double-knock the laptop palm rest or lid to send the clipboard to the phone. Use **Test knock** and the sensitivity slider to calibrate. The microphone is open only while knock-to-send is enabled and the workstation is unlocked; it is released when disabled or locked. Audio is processed in memory only and is never stored or sent anywhere.
+
+  ### Android
 
 Build the sideloadable debug APK with JDK 17 and Android SDK platform 35:
 
