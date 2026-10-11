@@ -11,6 +11,9 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
+import kotlin.time.Duration
+import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -364,7 +367,7 @@ class RelayClient(
         val webSocket = http.newWebSocket(request, listener)
         socket.set(webSocket)
         try {
-            withTimeout(STANDARD_TIMEOUT) { opened.await() }
+            withTimeout(STANDARD_TIMEOUT.milliseconds) { opened.await() }
             lastPongNanos.set(System.nanoTime())
             val worker = launch { for (frame in messages) processMessage(webSocket, frame) }
             val sender = launch { sendLoop(webSocket) }
@@ -496,7 +499,7 @@ class RelayClient(
             if (next.stored.isCompleted) continue
             try {
                 if (!socket.send(next.frame)) throw IOException("Relay WebSocket rejected a frame.")
-                withTimeout(STORED_TIMEOUT) { next.stored.await() }
+                withTimeout(STORED_TIMEOUT.milliseconds) { next.stored.await() }
             } catch (error: Exception) {
                 if (!next.stored.isCompleted) outgoing.trySend(next)
                 throw error
@@ -595,9 +598,6 @@ class RelayClient(
         synchronized(dedupeLock) { handlerFailures.remove(id) }
     }
 
-    private fun settingSeconds(name: String, default: Long): Long =
-        System.getenv(name)?.toLongOrNull()?.takeIf { it > 0 }?.coerceAtMost(3600) ?: default
-
     private fun mimeFor(extension: String): String = when (extension.lowercase()) {
         "png" -> "image/png"
         "jpg", "jpeg" -> "image/jpeg"
@@ -629,3 +629,10 @@ class RelayClient(
         private val BLOB_ID_PATTERN = Regex("[A-Za-z0-9_-]{22}")
     }
 }
+
+internal fun settingSeconds(
+    name: String,
+    default: Long,
+    environment: (String) -> String? = System::getenv,
+): Duration =
+    environment(name)?.toLongOrNull()?.takeIf { it > 0 }?.coerceAtMost(3600)?.seconds ?: default.seconds

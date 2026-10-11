@@ -1,7 +1,8 @@
 package dev.peytonli.tapdrop.core
 
 import java.io.File
-import java.util.concurrent.TimeUnit
+import kotlin.time.Duration.Companion.minutes
+import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
@@ -24,7 +25,7 @@ class InteropE2ETest {
             client.start("phone") { item ->
                 received.send(ObservedItem(item.item, item.blobFile?.readBytes()))
             }
-            withTimeout(TimeUnit.SECONDS.toMillis(45)) { client.connectionState.first { it.connected } }
+            withTimeout(45.seconds) { client.connectionState.first { it.connected } }
 
             client.sendText("android-to-laptop-text", "interop")
             client.sendUrl("https://example.com/tapdrop-android-e2e", "interop")
@@ -47,7 +48,7 @@ class InteropE2ETest {
     }
 
     private suspend fun receive(channel: Channel<ObservedItem>): ObservedItem =
-        withTimeout(TimeUnit.MINUTES.toMillis(3)) { channel.receive() }
+        withTimeout(3.minutes) { channel.receive() }
 
     private data class ObservedItem(val item: Item, val bytes: ByteArray?)
 }
