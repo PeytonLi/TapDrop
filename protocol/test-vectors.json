@@ -1,0 +1,35 @@
+{
+  "masterKey_b64u": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+  "pairId": "ZGVmZ2hpamtsbW5vcHFycw",
+  "encKey_hex": "a0b2452f07fe3a9b9b9e3a85b00184cf485000664d6aa68828a57a8c4a66acf5",
+  "authKey_hex": "df772d2e42f48515012db4a0148dd2028e0bbaa3c1eecf8638e4495d8ac45a84",
+  "authToken": "33ctLkL0hRUBLbSgFI3SAo4LuqPB7s-GOORJXYrEWoQ",
+  "tokenHash_hex": "a9a37c850a8077bafbc2ea555893a03ea210f111827170d27da509d1a1de7fe1",
+  "qrPayload": "tapdrop://pair?v=1&r=https%3A%2F%2Ftapdrop-relay.example.workers.dev&p=ZGVmZ2hpamtsbW5vcHFycw&k=AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8&n=Spectre%20x360",
+  "qrParsed": {
+    "v": 1,
+    "relayUrl": "https://tapdrop-relay.example.workers.dev",
+    "pairId": "ZGVmZ2hpamtsbW5vcHFycw",
+    "masterKey_b64u": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+    "deviceName": "Spectre x360"
+  },
+  "message": {
+    "id": "6f1c2b9e-3d4a-4c8b-9e2f-0a1b2c3d4e5f",
+    "from": "phone",
+    "aad": "tapdrop/v1/msg/ZGVmZ2hpamtsbW5vcHFycw/phone/6f1c2b9e-3d4a-4c8b-9e2f-0a1b2c3d4e5f",
+    "plaintext": "{\"kind\":\"url\",\"url\":\"https://example.com/a?b=c\",\"source\":\"share\",\"createdAt\":1760000000000,\"sender\":\"Galaxy S24\"}",
+    "nonce_b64u": "yMnKy8zNzs_Q0dLT",
+    "envelope": {
+      "v": 1,
+      "n": "yMnKy8zNzs_Q0dLT",
+      "c": "2m31jRDU6kXnlQQEfjLwziKVhsvc3YADCGRiAgPTS_HhGjTQwajxVQzm0sUfYYxvnRXreY36Zot_BY5fPJ-f_iJ_sbOhPmDIsq14wJ-_OxhqJD3qR0_lFEDYUCyrOsl-BtL1AokhrPoUOVWNhHexJC1n1pY1Ofy_ADEqY2TBJyYg"
+    }
+  },
+  "blob": {
+    "id": "MjM0NTY3ODk6Ozw9Pj9AQQ",
+    "aad": "tapdrop/v1/blob/ZGVmZ2hpamtsbW5vcHFycw/MjM0NTY3ODk6Ozw9Pj9AQQ",
+    "plaintext_hex": "54617044726f7020626c6f62207465737420766563746f7220000102ff",
+    "plaintext_sha256_hex": "ef4ab76df8c488001c35b1341c128e249b508d6aa67149cb1f1e92e36b76ec42",
+    "body_hex": "dcdddedfe0e1e2e3e4e5e6e711d172f11062c5f74f9050d199520afbbc86d113d19235a9bea2062a396a3438f5ffb46e32bcb6efaaf9d13567"
+  }
+}
