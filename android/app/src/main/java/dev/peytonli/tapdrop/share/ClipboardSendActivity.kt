@@ -3,7 +3,6 @@ package dev.peytonli.tapdrop.share
 import android.content.ClipboardManager
 import android.content.Context
 import android.os.Bundle
-import android.widget.Toast
 import androidx.activity.ComponentActivity
 import dev.peytonli.tapdrop.service.RelayService
 
@@ -24,7 +23,7 @@ class ClipboardSendActivity : ComponentActivity() {
         val text = item?.text?.toString()
         if (uri != null) RelayService.send(this, null, listOf(uri), "tile")
         else if (!text.isNullOrBlank()) RelayService.send(this, text, emptyList(), "tile")
-        else Toast.makeText(this, "Clipboard is empty", Toast.LENGTH_SHORT).show()
+        else RelayService.postTileFeedback(this, "Couldn't send", "Clipboard is empty")
         finish()
     }
 }

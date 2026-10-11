@@ -1,3 +1,5 @@
+import java.util.Base64
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -16,6 +18,39 @@ android {
         versionCode = 1
         versionName = "1.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+    }
+
+    signingConfigs {
+        create("release") {
+            val keystoreB64 = providers.environmentVariable("TAPDROP_KEYSTORE_B64").getOrElse("").trim()
+            val storePass = providers.environmentVariable("TAPDROP_KEYSTORE_PASSWORD").getOrElse("")
+            val keyAlias = providers.environmentVariable("TAPDROP_KEY_ALIAS").getOrElse("")
+            val keyPass = providers.environmentVariable("TAPDROP_KEY_PASSWORD").getOrElse("")
+            if (listOf(keystoreB64, storePass, keyAlias, keyPass).all { it.isNotBlank() }) {
+                val keystoreFile = layout.buildDirectory.file("signing/tapdrop-release.jks").get().asFile
+                keystoreFile.parentFile.mkdirs()
+                keystoreFile.writeBytes(Base64.getDecoder().decode(keystoreB64))
+                storeFile = keystoreFile
+                storePassword = storePass
+                this.keyAlias = keyAlias
+                keyPassword = keyPass
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            signingConfig = if (signingConfigs.getByName("release").storeFile != null) {
+                logger.lifecycle("TapDrop release build: signing with TAPDROP_KEYSTORE_B64 key")
+                signingConfigs.getByName("release")
+            } else {
+                logger.lifecycle("TapDrop release build: signing with debug key")
+                signingConfigs.getByName("debug")
+            }
+        }
     }
 
     buildFeatures {
