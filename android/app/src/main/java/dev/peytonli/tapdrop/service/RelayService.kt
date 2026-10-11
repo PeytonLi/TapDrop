@@ -45,6 +45,7 @@ import dev.peytonli.tapdrop.pairing.RecentStore
 import java.io.File
 import java.io.IOException
 import java.io.ByteArrayOutputStream
+import java.util.UUID
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -182,7 +183,7 @@ class RelayService : Service() {
                 try {
                     relayClient.sendFile(cached.file, cached.mime, source = source)
                 } finally {
-                    cached.file.delete()
+                    deleteCachedShare(cached.file, cacheDir)
                 }
             }
             if (!disconnected) {
@@ -204,11 +205,11 @@ class RelayService : Service() {
             ?: "shared-item"
         val displayName = File(rawName).name.ifBlank { "shared-item" }
         val mime = contentResolver.getType(uri) ?: "application/octet-stream"
-        val file = File.createTempFile("tapdrop-share-", ".cache", cacheDir)
+        val named = uniqueShareFile(cacheDir, displayName)
         try {
             val input = contentResolver.openInputStream(uri) ?: throw IOException("Could not open shared content.")
             input.use { source ->
-                file.outputStream().use { output ->
+                named.outputStream().use { output ->
                     val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
                     var total = 0L
                     while (true) {
@@ -220,11 +221,9 @@ class RelayService : Service() {
                     }
                 }
             }
-            val named = File(cacheDir, "${System.nanoTime()}-$displayName")
-            if (!file.renameTo(named)) throw IOException("Could not cache shared content.")
             CachedShare(named, mime)
         } catch (error: Exception) {
-            file.delete()
+            deleteCachedShare(named, cacheDir)
             throw error
         }
     }
@@ -286,7 +285,7 @@ class RelayService : Service() {
                 is TapPayload.Photo -> {
                     val cached = copySharedUri(payload.uri)
                     try { relayClient.sendFile(cached.file, cached.mime, source = "tap") }
-                    finally { cached.file.delete() }
+                    finally { deleteCachedShare(cached.file, cacheDir) }
                 }
                 is TapPayload.Screen -> {
                     val cached = File(cacheDir, payload.name)
@@ -561,6 +560,25 @@ class RelayService : Service() {
             context.stopService(Intent(context, RelayService::class.java))
             _status.value = RelayConnectionState()
         }
+    }
+}
+
+internal fun uniqueShareFile(cacheDir: File, displayName: String): File {
+    val sharesDirectory = File(cacheDir, "shares")
+    if (!sharesDirectory.isDirectory && !sharesDirectory.mkdirs()) {
+        throw IOException("Could not create share cache directory.")
+    }
+    val shareDirectory = File(sharesDirectory, UUID.randomUUID().toString())
+    if (!shareDirectory.mkdir()) throw IOException("Could not create unique share cache directory.")
+    return File(shareDirectory, displayName)
+}
+
+internal fun deleteCachedShare(file: File, cacheDir: File) {
+    file.delete()
+    val sharesDirectory = runCatching { File(cacheDir, "shares").canonicalFile }.getOrNull() ?: return
+    val parent = runCatching { file.canonicalFile.parentFile }.getOrNull() ?: return
+    if (parent.parentFile == sharesDirectory && parent.isDirectory && parent.list()?.isEmpty() == true) {
+        parent.delete()
     }
 }
 
