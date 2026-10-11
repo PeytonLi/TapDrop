@@ -4,9 +4,17 @@ import android.content.Context
 import android.content.SharedPreferences
 import dev.peytonli.tapdrop.core.TapConfig
 
+data class TapPreferenceState(
+    val enabled: Boolean = true,
+    val config: TapConfig = TapConfig(),
+    val dryRun: Boolean = false,
+)
+
 class TapSettings(context: Context) {
     val preferences: SharedPreferences =
         context.getSharedPreferences("tapdrop_magnet", Context.MODE_PRIVATE)
+
+    fun snapshot() = TapPreferenceState(enabled(), config(), dryRun())
 
     fun enabled(): Boolean = preferences.getBoolean(KEY_ENABLED, true)
 

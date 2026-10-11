@@ -40,7 +40,9 @@ class PairScannerActivity : ComponentActivity() {
                 val pair = scanned.copy(deviceName = Build.MODEL.ifBlank { "Android phone" })
                 client = RelayClient(pair, cacheDir)
                 withContext(Dispatchers.IO) { client.register() }
-                PairingStorage(this@PairScannerActivity).save(pair, scanned.deviceName)
+                withContext(Dispatchers.IO) {
+                    PairingStorage(this@PairScannerActivity).save(pair, scanned.deviceName)
+                }
                 RelayService.start(this@PairScannerActivity)
                 Toast.makeText(this@PairScannerActivity, "Paired with ${scanned.deviceName}", Toast.LENGTH_LONG).show()
                 setResult(RESULT_OK)

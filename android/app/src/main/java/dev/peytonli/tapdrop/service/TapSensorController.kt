@@ -38,19 +38,20 @@ object TapSensorStatus {
 
 class TapSensorController(
     context: Context,
+    private val settings: TapSettings,
+    initialSettings: TapPreferenceState,
     private val onTrigger: (TapTrigger) -> Unit,
 ) : SensorEventListener, SharedPreferences.OnSharedPreferenceChangeListener {
     private val appContext = context.applicationContext
     private val manager = appContext.getSystemService(Context.SENSOR_SERVICE) as SensorManager
     private val powerManager = appContext.getSystemService(Context.POWER_SERVICE) as PowerManager
     private val keyguardManager = appContext.getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
-    private val settings = TapSettings(appContext)
-    private val detector = TapDetector(settings.config())
+    private val detector = TapDetector(initialSettings.config)
     private val magneticSensor = manager.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD_UNCALIBRATED)
         ?: manager.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD)
     private val linearSensor = manager.getDefaultSensor(Sensor.TYPE_LINEAR_ACCELERATION)
     private val fallbackAccelerometer = if (linearSensor == null) manager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER) else null
-    private var enabled = settings.enabled()
+    private var enabled = initialSettings.enabled
     private var peerOnline = false
     private var screenInteractive = powerManager.isInteractive
     private var unlocked = !keyguardManager.isKeyguardLocked

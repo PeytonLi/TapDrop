@@ -47,17 +47,18 @@ class PairingStorage(context: Context) {
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         cipher.init(Cipher.ENCRYPT_MODE, key())
         val encrypted = cipher.iv + cipher.doFinal(pair.masterKeyBytes)
-        preferences.edit()
+        val committed = preferences.edit()
             .putString(KEY_RELAY, pair.relayUrl)
             .putString(KEY_PAIR_ID, pair.pairId)
             .putString(KEY_KEY, Base64.getEncoder().encodeToString(encrypted))
             .putString(KEY_LAPTOP_NAME, laptopName)
             .putString(KEY_DEVICE_NAME, pair.deviceName)
-            .apply()
+            .commit()
+        check(committed) { "Could not save pairing." }
     }
 
     fun clear() {
-        preferences.edit().clear().apply()
+        check(preferences.edit().clear().commit()) { "Could not clear pairing." }
         runCatching {
             KeyStore.getInstance("AndroidKeyStore").apply { load(null) }.deleteEntry(KEY_ALIAS)
         }

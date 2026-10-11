@@ -10,6 +10,7 @@ import java.util.UUID
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
+import kotlin.concurrent.thread
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -156,7 +157,18 @@ class RelayClient(
         socket.getAndSet(null)?.cancel()
         scope.coroutineContext[Job]?.cancel()
         http.dispatcher.cancelAll()
-        http.connectionPool.evictAll()
+        thread(name = "TapDrop-close", isDaemon = true) {
+            try {
+                http.connectionPool.evictAll()
+            } catch (error: Exception) {
+                runCatching { log("TapDrop connection cleanup failed: ${error.message}") }
+            }
+            try {
+                http.dispatcher.executorService.shutdown()
+            } catch (error: Exception) {
+                runCatching { log("TapDrop dispatcher cleanup failed: ${error.message}") }
+            }
+        }
     }
 
     suspend fun unpair() {

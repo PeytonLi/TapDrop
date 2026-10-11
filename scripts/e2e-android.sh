@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP="$(mktemp -d)"
+RELAY_PORT="${TAPDROP_E2E_RELAY_PORT:-8787}"
 RELAY_PID=""
 LISTENER_PID=""
 PHONE_TEST_PID=""
@@ -28,15 +29,16 @@ dotnet build windows/TapDrop.Cli/TapDrop.Cli.csproj --configuration Release --ve
 CLI="$ROOT/windows/TapDrop.Cli/bin/Release/net8.0/TapDrop.Cli.dll"
 
 cd "$ROOT/relay"
-./node_modules/.bin/wrangler dev --local --port 8787 --ip 127.0.0.1 --persist-to "$TMP/wrangler" >"$TMP/relay.log" 2>&1 &
+./node_modules/.bin/wrangler dev --local --port "$RELAY_PORT" --ip 127.0.0.1 --persist-to "$TMP/wrangler" >"$TMP/relay.log" 2>&1 &
 RELAY_PID=$!
 cd "$ROOT"
 
-python3 - "$TMP/relay.log" <<'PY'
+python3 - "$TMP/relay.log" "$RELAY_PORT" <<'PY'
 import sys, time, urllib.request
+port = int(sys.argv[2])
 for _ in range(100):
     try:
-        with urllib.request.urlopen("http://127.0.0.1:8787/v1/health", timeout=1) as response:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/v1/health", timeout=1) as response:
             if response.status == 200:
                 raise SystemExit(0)
     except Exception:
@@ -46,7 +48,7 @@ print(open(sys.argv[1], errors="replace").read())
 raise SystemExit("relay did not become ready")
 PY
 
-dotnet "$CLI" pair-new --relay http://127.0.0.1:8787 --name "TapDrop Laptop E2E" --out "$TMP/laptop.json" >"$TMP/qr.txt"
+dotnet "$CLI" pair-new --relay "http://127.0.0.1:$RELAY_PORT" --name "TapDrop Laptop E2E" --out "$TMP/laptop.json" >"$TMP/qr.txt"
 QR="$(<"$TMP/qr.txt")"
 mkdir -p "$TMP/laptop-files"
 dotnet "$CLI" listen --config "$TMP/laptop.json" --role laptop --save-dir "$TMP/laptop-files" >"$TMP/laptop.out" 2>"$TMP/laptop.err" &

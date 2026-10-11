@@ -46,6 +46,7 @@ import java.io.IOException
 import java.io.ByteArrayOutputStream
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -55,28 +56,32 @@ import kotlinx.coroutines.withContext
 
 class RelayService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private lateinit var pairingStorage: PairingStorage
+    private val pairingStorage by lazy { PairingStorage(this) }
     private var pairing: PairingRecord? = null
     private var client: RelayClient? = null
+    private var connectJob: Job? = null
     private var tapSensors: TapSensorController? = null
     private var networkManager: ConnectivityManager? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
 
     override fun onCreate() {
         super.onCreate()
-        pairingStorage = PairingStorage(this)
         createChannels()
         startForegroundStatus()
-        tapSensors = TapSensorController(this) { trigger ->
-            serviceScope.launch { handleTapTrigger(trigger) }
-        }
+        initializeTapSensors()
         connect()
         observeNetworkChanges()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
-            ACTION_SEND -> serviceScope.launch { sendSharedContent(intent) }
+            ACTION_SEND -> {
+                connect()
+                serviceScope.launch {
+                    connectJob?.join()
+                    sendSharedContent(intent)
+                }
+            }
             ACTION_STOP -> stopSelf()
             ACTION_START, null -> connect()
         }
@@ -97,22 +102,40 @@ class RelayService : Service() {
     }
 
     private fun connect() {
-        val saved = pairingStorage.load() ?: return
-        if (client != null) return
-        pairing = saved
-        val relayClient = RelayClient(saved.pair, cacheDir) { android.util.Log.w("TapDrop", it) }
-        client = relayClient
-        relayClient.start("phone") { received -> receive(saved, received) }
-        serviceScope.launch {
-            relayClient.connectionState.collect { state ->
-                _status.value = state
-                tapSensors?.setPeerOnline(state.peerOnline)
-                val description = when {
-                    state.peerOnline -> "Connected — laptop online"
-                    state.connected -> "Connected — laptop offline"
-                    else -> "Connecting to laptop"
+        if (client != null || connectJob?.isActive == true) return
+        connectJob = serviceScope.launch {
+            val saved = pairingStorage.load() ?: return@launch
+            withContext(Dispatchers.Main.immediate) {
+                if (client != null) return@withContext
+                pairing = saved
+                val relayClient = RelayClient(saved.pair, cacheDir) { android.util.Log.w("TapDrop", it) }
+                client = relayClient
+                relayClient.start("phone") { received -> receive(saved, received) }
+                serviceScope.launch {
+                    relayClient.connectionState.collect { state ->
+                        _status.value = state
+                        tapSensors?.setPeerOnline(state.peerOnline)
+                        val description = when {
+                            state.peerOnline -> "Connected — laptop online"
+                            state.connected -> "Connected — laptop offline"
+                            else -> "Connecting to laptop"
+                        }
+                        updateForegroundNotification(description)
+                    }
                 }
-                updateForegroundNotification(description)
+            }
+        }
+    }
+
+    private fun initializeTapSensors() {
+        serviceScope.launch {
+            val settings = TapSettings(applicationContext)
+            val initialSettings = settings.snapshot()
+            withContext(Dispatchers.Main.immediate) {
+                tapSensors = TapSensorController(this@RelayService, settings, initialSettings) { trigger ->
+                    serviceScope.launch { handleTapTrigger(trigger) }
+                }
+                tapSensors?.setPeerOnline(_status.value.peerOnline)
             }
         }
     }
@@ -491,7 +514,7 @@ class RelayService : Service() {
                 .putParcelableArrayListExtra(EXTRA_URIS, ArrayList(uris))
                 .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             if (uris.isNotEmpty()) {
-                val clip = android.content.ClipData.newUri(context.contentResolver, "TapDrop shared content", uris.first())
+                val clip = android.content.ClipData.newRawUri("TapDrop shared content", uris.first())
                 uris.drop(1).forEach { clip.addItem(android.content.ClipData.Item(it)) }
                 intent.clipData = clip
             }
@@ -517,6 +540,15 @@ class CopyTextReceiver : android.content.BroadcastReceiver() {
 class BootReceiver : android.content.BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent?) {
         if (intent?.action !in setOf(Intent.ACTION_BOOT_COMPLETED, Intent.ACTION_MY_PACKAGE_REPLACED)) return
-        if (PairingStorage(context).load() != null) RelayService.start(context)
+        val pendingResult = goAsync()
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                if (PairingStorage(context).load() != null) RelayService.start(context)
+            } catch (error: Exception) {
+                android.util.Log.e("TapDrop", "Unable to load pairing after boot", error)
+            } finally {
+                pendingResult.finish()
+            }
+        }
     }
 }

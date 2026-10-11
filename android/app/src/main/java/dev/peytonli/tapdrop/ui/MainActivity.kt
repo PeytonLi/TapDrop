@@ -59,56 +59,63 @@ import dev.peytonli.tapdrop.pairing.RecentStore
 import dev.peytonli.tapdrop.pairing.PairScannerActivity
 import dev.peytonli.tapdrop.service.RelayService
 import dev.peytonli.tapdrop.service.TapDropAccessibilityService
+import dev.peytonli.tapdrop.service.TapPreferenceState
 import dev.peytonli.tapdrop.service.TapSensorSnapshot
 import dev.peytonli.tapdrop.service.TapSensorStatus
 import dev.peytonli.tapdrop.service.TapSettings
 import dev.peytonli.tapdrop.share.SendClipboardTileService
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+
+private data class LoadedMainState(
+    val pairing: PairingRecord?,
+    val recent: List<RecentEntry>,
+    val tapSettings: TapSettings,
+    val tapPreferences: TapPreferenceState,
+)
 
 class MainActivity : ComponentActivity() {
     private val pairingStorage by lazy { PairingStorage(this) }
     private val recentStore by lazy { RecentStore(this) }
-    private var refreshScreen: (() -> Unit)? = null
+    private val pairingState = MutableStateFlow<PairingRecord?>(null)
+    private val recentState = MutableStateFlow<List<RecentEntry>>(emptyList())
+    private val tapPreferenceState = MutableStateFlow(TapPreferenceState())
+    private var tapSettings: TapSettings? = null
     private val pairLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
-        refreshScreen?.invoke()
+        refreshScreen()
     }
     private val notificationPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
     private val photoPermission = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        pairingStorage.load()?.let { RelayService.start(this) }
         setContent {
-            var paired by remember { mutableStateOf(pairingStorage.load()) }
-            var recent by remember { mutableStateOf(recentStore.load()) }
-            val tapSettings = remember { TapSettings(this@MainActivity) }
-            var magnetEnabled by remember { mutableStateOf(tapSettings.enabled()) }
-            var tapConfig by remember { mutableStateOf(tapSettings.config()) }
-            var dryRun by remember { mutableStateOf(tapSettings.dryRun()) }
+            val paired by pairingState.collectAsState()
+            val recent by recentState.collectAsState()
+            val tapPreferences by tapPreferenceState.collectAsState()
             var calibration by remember { mutableStateOf(false) }
             val sensorSnapshot by TapSensorStatus.state.collectAsState()
             val connection by RelayService.status.collectAsState()
-            refreshScreen = {
-                paired = pairingStorage.load()
-                recent = recentStore.load()
-                if (paired != null) RelayService.start(this)
-            }
             TapDropTheme {
                 if (calibration) {
                     CalibrationScreen(
                         snapshot = sensorSnapshot,
-                        config = tapConfig,
-                        dryRun = dryRun,
+                        config = tapPreferences.config,
+                        dryRun = tapPreferences.dryRun,
                         onBack = { calibration = false },
                         onConfigChange = {
-                            tapConfig = it
-                            tapSettings.setConfig(it)
+                            tapSettings?.let { settings ->
+                                settings.setConfig(it)
+                                tapPreferenceState.value = tapPreferenceState.value.copy(config = it)
+                            }
                         },
                         onDryRunChange = {
-                            dryRun = it
-                            tapSettings.setDryRun(it)
+                            tapSettings?.let { settings ->
+                                settings.setDryRun(it)
+                                tapPreferenceState.value = tapPreferenceState.value.copy(dryRun = it)
+                            }
                         },
                     )
                 } else {
@@ -117,11 +124,13 @@ class MainActivity : ComponentActivity() {
                         recent = recent,
                         connected = connection.connected,
                         peerOnline = connection.peerOnline,
-                        magnetEnabled = magnetEnabled,
+                        magnetEnabled = tapPreferences.enabled,
                         onMagnetEnabled = {
-                            magnetEnabled = it
-                            tapSettings.setEnabled(it)
-                            if (it && paired != null) RelayService.start(this)
+                            tapSettings?.let { settings ->
+                                settings.setEnabled(it)
+                                tapPreferenceState.value = tapPreferenceState.value.copy(enabled = it)
+                                if (it && paired != null) RelayService.start(this)
+                            }
                         },
                         onCalibration = { calibration = true },
                         onAccessibility = { openAccessibilitySettings() },
@@ -140,18 +149,39 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        refreshScreen?.invoke()
+        refreshScreen()
+    }
+
+    private fun refreshScreen() {
+        lifecycleScope.launch {
+            val loaded = withContext(Dispatchers.IO) {
+                val settings = TapSettings(this@MainActivity)
+                LoadedMainState(
+                    pairingStorage.load(),
+                    recentStore.load(),
+                    settings,
+                    settings.snapshot(),
+                )
+            }
+            tapSettings = loaded.tapSettings
+            tapPreferenceState.value = loaded.tapPreferences
+            pairingState.value = loaded.pairing
+            recentState.value = loaded.recent
+            if (loaded.pairing != null) RelayService.start(this@MainActivity)
+        }
     }
 
     private fun unpair() {
-        val saved = pairingStorage.load() ?: return
         lifecycleScope.launch {
+            val saved = withContext(Dispatchers.IO) { pairingStorage.load() } ?: return@launch
             val client = RelayClient(saved.pair, cacheDir)
             try {
-                withContext(Dispatchers.IO) { client.unpair() }
-                pairingStorage.clear()
+                withContext(Dispatchers.IO) {
+                    client.unpair()
+                    pairingStorage.clear()
+                }
                 RelayService.unpair(this@MainActivity)
-                refreshScreen?.invoke()
+                refreshScreen()
                 Toast.makeText(this@MainActivity, "Unpaired from ${saved.laptopName}", Toast.LENGTH_SHORT).show()
             } catch (error: Exception) {
                 Toast.makeText(this@MainActivity, error.message ?: "Could not unpair", Toast.LENGTH_LONG).show()
@@ -224,7 +254,19 @@ class MainActivity : ComponentActivity() {
                     Toast.makeText(this, "Copied to clipboard", Toast.LENGTH_SHORT).show()
                 }
                 "url" -> startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(entry.text)))
-                else -> startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(Uri.parse(entry.uri), contentResolver.getType(Uri.parse(entry.uri))).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))
+                else -> lifecycleScope.launch {
+                    try {
+                        val uri = Uri.parse(entry.uri)
+                        val mime = withContext(Dispatchers.IO) { contentResolver.getType(uri) }
+                        startActivity(
+                            Intent(Intent.ACTION_VIEW)
+                                .setDataAndType(uri, mime)
+                                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION),
+                        )
+                    } catch (error: Exception) {
+                        Toast.makeText(this@MainActivity, error.message ?: "Could not open recent item", Toast.LENGTH_SHORT).show()
+                    }
+                }
             }
         } catch (error: Exception) {
             Toast.makeText(this, error.message ?: "Could not open recent item", Toast.LENGTH_SHORT).show()
