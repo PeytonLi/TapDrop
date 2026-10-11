@@ -7,7 +7,7 @@ namespace TapDrop.Tray;
 
 internal sealed class TrayConfig
 {
-    public string RelayUrl { get; set; } = "";
+    public string RelayUrl { get; set; } = RelayDefaults.Url;
     public string PairId { get; set; } = "";
     public string ProtectedMasterKey { get; set; } = "";
     public string DeviceName { get; set; } = Environment.MachineName;

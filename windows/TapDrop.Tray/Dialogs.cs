@@ -18,7 +18,7 @@ internal sealed class SettingsDialog : Form
         Width = 480;
         Height = 190;
 
-        _relay.Text = config.RelayUrl;
+        _relay.Text = string.IsNullOrWhiteSpace(config.RelayUrl) ? RelayDefaults.Url : config.RelayUrl;
         _name.Text = config.DeviceName;
         var layout = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(12), ColumnCount = 2, RowCount = 3 };
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 110));
